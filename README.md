@@ -26,7 +26,7 @@ Slide Narrator reads the speaker notes on every slide, voices them with a natura
 |---|---|---|
 | `NaturalVoiceSAPIAdapter_v0.2.9_x86_x64.zip` | [github.com/gexgd0419/NaturalVoiceSAPIAdapter/releases](https://github.com/gexgd0419/NaturalVoiceSAPIAdapter/releases) | No, but strongly recommended |
 | `ms_natural_voice_en_au.zip` | [cross-plus-a.com/voice.htm](https://www.cross-plus-a.com/voice.htm) | No, but strongly recommended |
-| `balcon.zip` | [cross-plus-a.com/bconsole.htm](https://www.cross-plus-a.com/bconsole.htm) | No, but strongly recommended |
+| `balcon.zip` | [cross-plus-a.com/bconsole.htm](https://www.cross-plus-a.com/bconsole.htm) | Optional (backup speech engine) |
 | `ffmpeg.exe` | [ffmpeg.org/download.html](https://ffmpeg.org/download.html) | No, but strongly recommended |
 | `Slide-Narrator.ps1` and `Slide-Narrator.bat` | This repository | Required |
 
