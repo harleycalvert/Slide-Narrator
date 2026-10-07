@@ -391,7 +391,7 @@ try {
             $a += @("-i", $meta); $map += @("-map_metadata", "2", "-map_chapters", "2")
         }
         $vcv = $vc + @("-g", "1", "-pix_fmt", "yuv420p")
-        $tail = @("-c:a", "aac", "-b:a", "128k", "-t", $clock.ToString("0.###", [Globalization.CultureInfo]::InvariantCulture), "-movflags", "+faststart")
+        $tail = @("-c:a", "aac", "-b:a", "64k", "-t", $clock.ToString("0.###", [Globalization.CultureInfo]::InvariantCulture), "-movflags", "+faststart")
         if ($job.Codec -eq "h265") { $tail += @("-tag:v", "hvc1") }
         $out = & $ff @($a + $map + $vcv + @("-fps_mode", "vfr") + $tail + @($job.Out)) 2>&1
         if ($LASTEXITCODE -ne 0) {   # older ffmpeg: -vsync instead of -fps_mode
@@ -439,7 +439,7 @@ try {
         [IO.File]::WriteAllLines($meta, $ml, (New-Object System.Text.UTF8Encoding($false)))
         $a += @("-i", $meta, "-map", "0:v", "-map", "0:a", "-map_metadata", "1", "-map_chapters", "1")
     }
-    $a += @("-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart")
+    $a += @("-c:v", "copy", "-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart")
     if ($job.Codec -eq "h265") { $a += @("-tag:v", "hvc1") }
     $a += $job.Out
     $out = & $ff @a 2>&1

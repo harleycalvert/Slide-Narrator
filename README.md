@@ -4,8 +4,6 @@ Turn PowerPoint speaker notes into natural-voice narration and export as video. 
 
 Slide Narrator reads the speaker notes on every slide, voices them with a natural-sounding text-to-speech voice, inserts the audio into each slide (set to play and advance automatically), and can export the result as an MP4. Your original PowerPoint is never changed.
 
-It's built for speed: one slide is voiced per CPU thread, and several videos can be built in parallel. The videos are up to 4K resolution with tiny file sizes. Each slide is stored as a single frame for as long as its narration runs.
-
 ## Features
 
 - **Drag and drop:** add one deck, many decks, or a whole folder.
@@ -33,6 +31,8 @@ It's built for speed: one slide is voiced per CPU thread, and several videos can
 | `Slide-Narrator.ps1` and `Slide-Narrator.bat` | This repository | Required |
 
 Only the app is strictly required. Windows has basic built-in voices, but they sound robotic. For natural voices, install the adapter.
+
+Before extracting each zip, unblock it: right-click it, choose **Properties**, tick **Unblock**, then click **OK**.
 
 ## Setup
 
@@ -126,7 +126,7 @@ Acronyms are spelled out for the voice, for example `WHS` becomes "W H S". The l
 ## How it works
 
 1. **Read:** speaker notes are read from each deck through PowerPoint automation, then cleaned and prepared for pronunciation.
-2. **Voice:** background workers turn each slide's notes into a WAV file. The app uses SAPI 5 directly in 64-bit, a 32-bit SAPI helper, or `balcon.exe`, whichever works for the chosen voice. ffmpeg then converts each WAV to AAC.
+2. **Voice:** background workers turn each slide's notes into a WAV file. The app uses SAPI 5 directly in 64-bit, a 32-bit SAPI helper, or `balcon.exe`, whichever works for the chosen voice. ffmpeg then converts each WAV to 64 kbps mono AAC for the PowerPoint. Videos are encoded separately from the original WAVs, also at 64 kbps, so the audio is only compressed once.
 3. **Build:** the audio is embedded in each slide, set to play automatically, and the slide advances one second after the audio ends. The deck is saved as `_narrated.pptx`.
 4. **Video:** slides are exported as PNG pictures, and ffmpeg combines them with the WAV audio, adding chapters if you chose them. The PowerPoint method uses PowerPoint's own **Create a Video** export instead.
 
