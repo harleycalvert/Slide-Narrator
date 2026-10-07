@@ -1,22 +1,36 @@
 ﻿<#
   Slide Narrator
   ------------------------------------------------------------------
-  A small Windows app. Drag a PowerPoint file onto the window, pick a
-  voice, and click Start. For every slide it:
-    1. reads the speaker notes
-    2. turns them into audio with Balabolka's balcon.exe
-    3. inserts the audio into the slide (plays automatically, icon hidden)
-    4. sets the slide to advance when the audio ends
-  It saves a new file  <deck>_narrated.pptx  next to the original
-  (the original is not changed), and can also export an MP4.
+  Turns PowerPoint speaker notes into natural-voice narration and
+  exports narrated decks and videos.
+
+  Drag one or more decks (or a folder) onto the window, pick a voice,
+  and click Start. For every slide it:
+    1. reads and cleans the speaker notes
+    2. makes the audio in the background, several slides at a time
+       (Windows speech 64-bit, a 32-bit helper, or balcon.exe -
+       whichever works for the chosen voice), then converts it to AAC
+    3. inserts the audio into the slide (plays automatically, icon
+       hidden) and sets the slide to advance when the audio ends
+  It saves  <deck>_narrated.pptx  next to the original (the original is
+  never changed), plus a log:  <deck>_narration.log
+
+  Video (optional):
+    - Fast - ffmpeg H.264 or H.265: slide pictures + audio, built in
+      the background, several videos at once. 720p to 4K, fixed frame
+      rates or 1 frame per slide (VFR).
+    - PowerPoint: PowerPoint's own export (keeps animations; slower).
+    - Chapters by section or by slide.
+  Recommended: Fast - ffmpeg H.264, 4K, 1 per slide (VFR).
 
   Start it by double-clicking  Slide-Narrator.bat
-  You can also drag a .pptx straight onto Slide-Narrator.bat.
+  You can also drag .pptx files onto Slide-Narrator.bat.
 
-  Needs: Windows, PowerPoint, and balcon.exe
-  (https://www.cross-plus-a.com/bconsole.htm). Put balcon.exe next to
-  this file, in a "balcon" subfolder, or in C:\balcon.
-  ffmpeg is optional (smaller AAC audio instead of WAV, plus fast video).
+  Needs: Windows 10/11, PowerPoint (Microsoft 365).
+  Recommended: NaturalVoiceSAPIAdapter (natural voices),
+               ffmpeg.exe (AAC audio, fast video, chapters).
+  Optional:    balcon.exe (backup speech engine).
+  Put ffmpeg.exe and a "balcon" subfolder next to this file.
   ------------------------------------------------------------------
 #>
 
@@ -25,6 +39,10 @@ param([Parameter(ValueFromRemainingArguments = $true)][string[]]$StartFiles)
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
+
+# balcon.exe renames the console window to "Balabolka" when it runs; this puts our name back
+function Reset-ConsoleTitle { try { $Host.UI.RawUI.WindowTitle = "Slide Narrator - console (leave this open)" } catch {} }
+Reset-ConsoleTitle
 
 $AppDir       = $PSScriptRoot
 $SettingsFile = Join-Path $AppDir "Slide-Narrator.settings.json"
@@ -81,6 +99,7 @@ function Get-Voices([string]$balconPath) {
             $tmp = Join-Path $env:TEMP "slide-narrator-voices.txt"
             if (Test-Path $tmp) { Remove-Item $tmp -Force }
             cmd /c "`"$balconPath`" -l > `"$tmp`" 2>&1" | Out-Null
+            Reset-ConsoleTitle
             if (Test-Path $tmp) {
                 foreach ($l in (Get-Content $tmp)) {
                     $t = "$l".Trim()
@@ -151,6 +170,7 @@ function Invoke-Balcon([string]$text, [string]$wavPath, [string]$voice, [int]$ra
     if ($short -and $short -ne $voice) { $names += $short }
     foreach ($nm in $names) {
         $out = & $script:BalconExe -f $tmp -w $wavPath -n $nm -s $rate -enc utf8 2>&1
+        Reset-ConsoleTitle
         $code = $LASTEXITCODE
         $ok = (Test-Path $wavPath) -and ((Get-Item $wavPath).Length -gt 1000)
         if ($ok) { return $true }
@@ -299,6 +319,12 @@ param([string]$JobFile)
 $ErrorActionPreference = "Continue"   # native tools write to stderr; we check exit codes instead
 $job = Get-Content -LiteralPath $JobFile -Raw | ConvertFrom-Json
 $log = $job.Log
+# Progress file is read by the app while we write it: retry briefly, and never fail the job over it
+function SetProg([string]$v) {
+    for ($i = 0; $i -lt 40; $i++) {
+        try { [IO.File]::WriteAllText($job.Progress, $v); return } catch { Start-Sleep -Milliseconds 50 }
+    }
+}
 function W([string]$m) { try { Add-Content -LiteralPath $log -Value ((Get-Date -Format "HH:mm:ss") + "  " + $m) -Encoding UTF8 } catch {} }
 try {
     $ff = $job.Ffmpeg; $fps = [int]$job.Fps
@@ -308,6 +334,24 @@ try {
         # ---- One frame per slide (variable frame rate) ----
         $total = @($job.Segments).Count; $n = 0; $clock = 0.0; $chapters = @()
         $imgLines = @(); $audLines = @(); $pads = @()
+        # Prepare each slide's audio in parallel (one small ffmpeg per slide)
+        $threads = 4; if ($job.Threads) { $threads = [Math]::Max(1, [int]$job.Threads) }
+        $q2 = { param($x) '"' + $x + '"' }
+        $running = New-Object System.Collections.ArrayList
+        $doneCount = 0
+        function Wait-Slots([int]$max) {
+            while ($running.Count -ge $max) {
+                for ($k = $running.Count - 1; $k -ge 0; $k--) {
+                    $pr = $running[$k]
+                    if ($pr.P.HasExited) {
+                        if ($pr.P.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $pr.Pad)) { throw "slide $($pr.Index) audio: " + $pr.P.StandardError.ReadToEnd() }
+                        $running.RemoveAt($k); $script:doneCount++
+                        SetProg "$($script:doneCount)/$total"
+                    }
+                }
+                if ($running.Count -ge $max) { Start-Sleep -Milliseconds 50 }
+            }
+        }
         foreach ($s in $job.Segments) {
             $n++
             $secs = [Math]::Round([double]$s.Dur, 3)
@@ -315,16 +359,19 @@ try {
             $clock += $secs
             $dur = $secs.ToString("0.###", [Globalization.CultureInfo]::InvariantCulture)
             $pad = Join-Path $job.WorkDir ("pad_{0:D3}.wav" -f $n)
-            if ($s.Wav) { $a = @("-y", "-loglevel", "error", "-i", $s.Wav, "-af", "apad", "-t", $dur, "-ar", "48000", "-ac", "1", "-c:a", "pcm_s16le", $pad) }
-            else        { $a = @("-y", "-loglevel", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono", "-t", $dur, "-c:a", "pcm_s16le", $pad) }
-            $out = & $ff @a 2>&1
-            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $pad)) { throw "slide $($s.Index) audio: " + (($out | Out-String).Trim()) }
+            if ($s.Wav) { $argLine = "-y -loglevel error -i " + (& $q2 $s.Wav) + " -af apad -t $dur -ar 48000 -ac 1 -c:a pcm_s16le " + (& $q2 $pad) }
+            else        { $argLine = "-y -loglevel error -f lavfi -i anullsrc=r=48000:cl=mono -t $dur -c:a pcm_s16le " + (& $q2 $pad) }
+            Wait-Slots $threads
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $ff; $psi.Arguments = $argLine
+            $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; $psi.RedirectStandardError = $true
+            [void]$running.Add([pscustomobject]@{ P = [System.Diagnostics.Process]::Start($psi); Pad = $pad; Index = $s.Index })
             $pads += $pad
             $q = { param($x) "file '" + ($x -replace "'", "'\''") + "'" }
             $imgLines += (& $q $s.Img); $imgLines += "duration $dur"
             $audLines += (& $q $pad)
-            Set-Content -LiteralPath $job.Progress -Value "$n/$total"
         }
+        Wait-Slots 1   # wait for all audio pieces to finish
         $imgLines += (& $q (@($job.Segments)[-1].Img))      # concat quirk: repeat the last picture
         $utf8 = New-Object System.Text.UTF8Encoding($false)
         $imgList = Join-Path $job.WorkDir "images.txt"; [IO.File]::WriteAllLines($imgList, $imgLines, $utf8)
@@ -352,7 +399,7 @@ try {
         }
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $job.Out)) { throw "building video: " + (($out | Out-String).Trim()) }
         foreach ($pd in $pads) { Remove-Item -LiteralPath $pd -Force -ErrorAction SilentlyContinue }
-        Set-Content -LiteralPath $job.Progress -Value "done"
+        SetProg "done"
         exit 0
     }
 
@@ -373,7 +420,7 @@ try {
         $out = & $ff @a 2>&1
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $seg)) { throw "slide $($s.Index): " + (($out | Out-String).Trim()) }
         $segs += $seg
-        Set-Content -LiteralPath $job.Progress -Value "$n/$total"
+        SetProg "$n/$total"
     }
     $list = Join-Path $job.WorkDir "segments.txt"
     $lines = $segs | ForEach-Object { "file '" + ($_ -replace "'", "'\''") + "'" }
@@ -398,11 +445,11 @@ try {
     $out = & $ff @a 2>&1
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $job.Out)) { throw "joining: " + (($out | Out-String).Trim()) }
     foreach ($sg in $segs) { Remove-Item -LiteralPath $sg -Force -ErrorAction SilentlyContinue }
-    Set-Content -LiteralPath $job.Progress -Value "done"
+    SetProg "done"
     exit 0
 } catch {
     W ("VIDEO FAILED: " + $_.Exception.Message)
-    Set-Content -LiteralPath $job.Progress -Value ("failed: " + $_.Exception.Message)
+    SetProg ("failed: " + $_.Exception.Message)
     exit 1
 }
 '@
@@ -664,6 +711,35 @@ function Fill-Choices($box, $choices, [bool]$ffmpeg, $wanted, $fallback) {
 }
 function Choice-Value($choices, [string]$text) { foreach ($c in $choices) { if ($c.T -eq $text) { return $c.V } }; return $null }
 
+# ---- Hardware, for the "Auto" settings ----
+$script:LogicalCores  = [Environment]::ProcessorCount
+$script:PhysicalCores = $script:LogicalCores
+try { $script:PhysicalCores = [int](@(Get-CimInstance Win32_Processor -ErrorAction Stop | Measure-Object -Property NumberOfCores -Sum).Sum) } catch {}
+if ($script:PhysicalCores -lt 1) { $script:PhysicalCores = $script:LogicalCores }
+$script:TotalMemMB = 8192
+try { $script:TotalMemMB = [int]((Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).TotalPhysicalMemory / 1MB) } catch {}
+
+# Slides voiced at once: Online voices are limited by Microsoft, Native voices by cores and memory
+function Get-AutoSlides([string]$voice) {
+    if ($voice -match 'Online') { return 4 }
+    $byMem = [int][Math]::Floor(($script:TotalMemMB / 2) / 250)     # use at most half the RAM, ~250 MB per voice
+    return [Math]::Max(2, [Math]::Min(32, [Math]::Min($script:PhysicalCores, $byMem)))
+}
+# Videos built at once: VFR jobs are light; fixed-frame-rate encodes already use most cores
+function Get-AutoVideos([bool]$fast, [int]$fps, [int]$decks) {
+    if (-not $fast) { return 1 }
+    if ($fps -eq 0) {
+        $n = [Math]::Floor($script:LogicalCores / 4)                      # VFR jobs are light
+        $n = [Math]::Min($n, [Math]::Floor(($script:TotalMemMB / 2) / 600)) # ~600 MB each at 4K
+    } else {
+        if ($script:LogicalCores -ge 16) { $n = 2 } else { $n = 1 }       # fixed-rate encodes already use most cores
+        $n = [Math]::Min($n, [Math]::Floor(($script:TotalMemMB / 2) / 2000))
+    }
+    # No point building more videos at once than there are decks (0 = list empty, don't cap)
+    if ($decks -gt 0) { $n = [Math]::Min($n, $decks) }
+    return [int][Math]::Max(1, [Math]::Min(12, $n))
+}
+
 $lblPar = New-Object System.Windows.Forms.Label
 $lblPar.Text = "Slides at once:"
 $lblPar.Location = New-Object System.Drawing.Point(330, 27)
@@ -673,8 +749,15 @@ $grp.Controls.Add($lblPar)
 $parallelBox = New-Object System.Windows.Forms.NumericUpDown
 $parallelBox.Location = New-Object System.Drawing.Point(445, 23)
 $parallelBox.Size = New-Object System.Drawing.Size(55, 26)
-$parallelBox.Minimum = 1; $parallelBox.Maximum = 8; $parallelBox.Value = 4
+$parallelBox.Minimum = 1; $parallelBox.Maximum = 32; $parallelBox.Value = 4
 $grp.Controls.Add($parallelBox)
+
+$autoSlides = New-Object System.Windows.Forms.CheckBox
+$autoSlides.Text = "Auto"
+$autoSlides.Location = New-Object System.Drawing.Point(507, 25)
+$autoSlides.AutoSize = $true
+$autoSlides.Checked = $true
+$grp.Controls.Add($autoSlides)
 
 $lblMethod = New-Object System.Windows.Forms.Label
 $lblMethod.Text = "Video method:"
@@ -699,8 +782,15 @@ $grp.Controls.Add($lblVidPar)
 $videoParBox = New-Object System.Windows.Forms.NumericUpDown
 $videoParBox.Location = New-Object System.Drawing.Point(445, 88)
 $videoParBox.Size = New-Object System.Drawing.Size(55, 26)
-$videoParBox.Minimum = 1; $videoParBox.Maximum = 6; $videoParBox.Value = 2
+$videoParBox.Minimum = 1; $videoParBox.Maximum = 12; $videoParBox.Value = 2
 $grp.Controls.Add($videoParBox)
+
+$autoVideos = New-Object System.Windows.Forms.CheckBox
+$autoVideos.Text = "Auto"
+$autoVideos.Location = New-Object System.Drawing.Point(507, 90)
+$autoVideos.AutoSize = $true
+$autoVideos.Checked = $true
+$grp.Controls.Add($autoVideos)
 
 $lblChap = New-Object System.Windows.Forms.Label
 $lblChap.Text = "Chapters:"
@@ -718,7 +808,7 @@ $grp.Controls.Add($chapterBox)
 
 function Update-VideoChoices($wantRes, $wantFps) {
     $ff = $methodBox.SelectedIndex -lt 2
-    Fill-Choices $resBox $script:ResChoices $ff $wantRes "1080p"
+    Fill-Choices $resBox $script:ResChoices $ff $wantRes "4K / 2160p"
     Fill-Choices $fpsBox $script:FpsChoices $ff $wantFps $(if ($ff) { "1 per slide (VFR)" } else { "15 fps" })
 }
 Update-VideoChoices $null $null
@@ -804,7 +894,7 @@ function Start-LogFile($settings, [string]$path) {
 # ---------- Startup checks ----------
 $script:BalconExe = Find-Balcon
 $script:Ffmpeg    = Find-Ffmpeg $script:BalconExe
-$script:Cancel    = $false
+$script:StopRequested    = $false
 
 if ($script:BalconExe) { Log "balcon: $($script:BalconExe) (backup engine)" }
 else { Log "balcon.exe not found. That's OK: Windows speech will be used directly." }
@@ -812,6 +902,7 @@ $voices = Get-Voices $script:BalconExe
 foreach ($v in $voices) { [void]$voiceBox.Items.Add($v) }
 if ($voiceBox.Items.Count -eq 0) { Log "No voices found automatically. You can type the voice name into the Voice box." }
 else { Log "Voices found: $($voiceBox.Items.Count)"; foreach ($v in $voices) { $script:StartupLines.Add("   voice: $v") } }
+Log ("CPU: {0} cores / {1} threads, RAM: {2:N0} GB" -f $script:PhysicalCores, $script:LogicalCores, ($script:TotalMemMB / 1024))
 if ($script:Ffmpeg) { Log "ffmpeg: found (audio saved as AAC .m4a)" } else { Log "ffmpeg: not found (audio saved as WAV, which works fine)" }
 
 # Restore last settings
@@ -821,9 +912,11 @@ if ($saved) {
     if ($null -ne $saved.Speed) { $speed.Value = [Math]::Max(-5, [Math]::Min(5, [int]$saved.Speed)) }
     if ($saved.Video) { $rbVideo.Checked = $true }
 
-    if ($saved.Parallel) { $parallelBox.Value = [Math]::Max(1, [Math]::Min(8, [int]$saved.Parallel)) }
+    if ($saved.Parallel) { $parallelBox.Value = [Math]::Max(1, [Math]::Min(32, [int]$saved.Parallel)) }
+    if ($null -ne $saved.AutoSlides) { $autoSlides.Checked = [bool]$saved.AutoSlides }
+    if ($null -ne $saved.AutoVideos) { $autoVideos.Checked = [bool]$saved.AutoVideos }
     if ($null -ne $saved.Method -and [int]$saved.Method -lt $methodBox.Items.Count) { $methodBox.SelectedIndex = [int]$saved.Method }
-    if ($saved.VideoParallel) { $videoParBox.Value = [Math]::Max(1, [Math]::Min(6, [int]$saved.VideoParallel)) }
+    if ($saved.VideoParallel) { $videoParBox.Value = [Math]::Max(1, [Math]::Min(12, [int]$saved.VideoParallel)) }
     if ($null -ne $saved.Chapters -and [int]$saved.Chapters -lt $chapterBox.Items.Count) { $chapterBox.SelectedIndex = [int]$saved.Chapters }
     Update-VideoChoices $saved.Resolution $saved.FrameRate
 }
@@ -860,6 +953,7 @@ function Add-Files($paths) {
 }
 
 function Update-DropText {
+    Update-AutoValues
     $n = $fileList.Items.Count
     if ($n -eq 0) {
         $drop.Text = "Drag PowerPoint files (or a folder) here - as many as you like"
@@ -900,8 +994,28 @@ $fileList.Add_KeyDown({ param($s, $e) if ($e.KeyCode -eq "Delete") { $removeBtn.
 $drop.Add_Click({ $browse.PerformClick() })
 
 $speed.Add_ValueChanged({ $lblSpeed.Text = "Speed: $($speed.Value)" })
-$rbVideo.Add_CheckedChanged({ $resBox.Enabled = $rbVideo.Checked; $fpsBox.Enabled = $rbVideo.Checked; $methodBox.Enabled = $rbVideo.Checked; $videoParBox.Enabled = $rbVideo.Checked; $chapterBox.Enabled = $rbVideo.Checked })
-$resBox.Enabled = $rbVideo.Checked; $fpsBox.Enabled = $rbVideo.Checked; $methodBox.Enabled = $rbVideo.Checked; $videoParBox.Enabled = $rbVideo.Checked; $chapterBox.Enabled = $rbVideo.Checked
+$rbVideo.Add_CheckedChanged({ $resBox.Enabled = $rbVideo.Checked; $fpsBox.Enabled = $rbVideo.Checked; $methodBox.Enabled = $rbVideo.Checked; $videoParBox.Enabled = $rbVideo.Checked -and -not $autoVideos.Checked; $autoVideos.Enabled = $rbVideo.Checked; $chapterBox.Enabled = $rbVideo.Checked })
+# Show the Auto numbers straight away, and keep them up to date as settings change
+function Update-AutoValues {
+    if ($autoSlides.Checked) {
+        $v = Get-AutoSlides "$($voiceBox.Text)"
+        $parallelBox.Value = [Math]::Max($parallelBox.Minimum, [Math]::Min($parallelBox.Maximum, $v))
+    }
+    if ($autoVideos.Checked) {
+        $fast = $methodBox.SelectedIndex -lt 2
+        $f = Choice-Value $script:FpsChoices "$($fpsBox.SelectedItem)"; if ($null -eq $f) { $f = 15 }
+        $v = Get-AutoVideos $fast $f $fileList.Items.Count
+        $videoParBox.Value = [Math]::Max($videoParBox.Minimum, [Math]::Min($videoParBox.Maximum, $v))
+    }
+}
+$autoSlides.Add_CheckedChanged({ $parallelBox.Enabled = -not $autoSlides.Checked; Update-AutoValues })
+$autoVideos.Add_CheckedChanged({ $videoParBox.Enabled = $rbVideo.Checked -and -not $autoVideos.Checked; Update-AutoValues })
+$voiceBox.Add_SelectedIndexChanged({ Update-AutoValues })
+$voiceBox.Add_TextChanged({ Update-AutoValues })
+$methodBox.Add_SelectedIndexChanged({ Update-AutoValues })
+$fpsBox.Add_SelectedIndexChanged({ Update-AutoValues })
+Update-AutoValues
+$resBox.Enabled = $rbVideo.Checked; $fpsBox.Enabled = $rbVideo.Checked; $methodBox.Enabled = $rbVideo.Checked; $videoParBox.Enabled = $rbVideo.Checked -and -not $autoVideos.Checked; $autoVideos.Enabled = $rbVideo.Checked; $chapterBox.Enabled = $rbVideo.Checked; $parallelBox.Enabled = -not $autoSlides.Checked
 
 $preview.Add_Click({
     if (-not $voiceBox.Text.Trim()) { return }
@@ -938,7 +1052,7 @@ $testAll.Add_Click({
     $testAll.Enabled = $true; $start.Enabled = $true
 })
 
-$cancel.Add_Click({ $script:Cancel = $true; Log "Cancelling after the current slide..." })
+$cancel.Add_Click({ $script:StopRequested = $true; Log "Cancelling after the current slide..." })
 
 # ---------- The main job ----------
 # How it works (fast mode):
@@ -1005,6 +1119,14 @@ function Start-AudioJob($job) {
 }
 
 # Check running jobs, start new ones, update progress. Call this often.
+# Read a small text file without locking it (the video worker may be writing it)
+function Read-Shared([string]$path) {
+    try {
+        $fs = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+        try { return (New-Object IO.StreamReader($fs)).ReadToEnd().Trim() } finally { $fs.Dispose() }
+    } catch { return "" }
+}
+
 function Pump-Video {
     $r = $script:Run
     $running = 0; $queued = 0; $done = 0; $status = @()
@@ -1013,13 +1135,14 @@ function Pump-Video {
         if (-not $v.Proc) { $queued++; continue }
         if ($v.Proc.HasExited) {
             $v.Done = $true; $done++
-            $p = ""; try { $p = (Get-Content -LiteralPath $v.Progress -Raw).Trim() } catch {}
-            $v.Ok = ($p -eq "done") -and (Test-Path -LiteralPath $v.Out)
+            $p = Read-Shared $v.Progress
+            $code = -1; try { $code = $v.Proc.ExitCode } catch {}
+            $v.Ok = (($p -eq "done") -or ($code -eq 0)) -and (Test-Path -LiteralPath $v.Out)
             if ($v.Ok) { $v.Deck.VideoNote = "video OK"; Log-To $v.Deck.Log "Saved video: $($v.Out)" }
             else { $v.Deck.VideoNote = "video FAILED"; Log-To $v.Deck.Log "Video failed for $($v.Deck.Name): $p" }
         } else {
             $running++
-            $p = ""; try { $p = (Get-Content -LiteralPath $v.Progress -Raw -ErrorAction Stop).Trim() } catch {}
+            $p = Read-Shared $v.Progress
             if ($p) { $status += "$($v.Deck.Name) $p" }
         }
     }
@@ -1041,7 +1164,7 @@ function Pump-Video {
 
 function Pump-Audio {
     $r = $script:Run
-    if ($script:Cancel) {
+    if ($script:StopRequested) {
         foreach ($j in $r.Jobs) { if ($j.Proc -and -not $j.Proc.HasExited) { try { $j.Proc.Kill() } catch {} } }
         foreach ($v in $r.Videos) { if ($v.Proc -and -not $v.Proc.HasExited) { try { $v.Proc.Kill() } catch {}; Get-Process ffmpeg -ErrorAction SilentlyContinue | Where-Object { $_.StartTime -ge $v.Proc.StartTime } | ForEach-Object { try { $_.Kill() } catch {} } } }
         throw "Cancelled."
@@ -1196,6 +1319,7 @@ function Build-Deck($ppt, $deck) {
             $vjob = [pscustomobject]@{
                 Ffmpeg = $script:Ffmpeg; Fps = $r.Fps; Codec = $r.Codec; WorkDir = $deck.WorkDir; Log = $deck.Log
                 Progress = (Join-Path $deck.WorkDir "video-progress.txt"); Out = $deck.OutMp4; Segments = $segments
+                Threads = [Math]::Max(2, [int][Math]::Floor($script:LogicalCores / [Math]::Max(1, $r.VideoParallel)))
             }
             $jf = Join-Path $deck.WorkDir "video-job.json"
             [IO.File]::WriteAllText($jf, ($vjob | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
@@ -1232,7 +1356,9 @@ $start.Add_Click({
     if ($fileList.Items.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show("Drag one or more PowerPoint files onto the window first.", "Slide Narrator") | Out-Null; return }
     if (-not $voiceBox.Text.Trim()) { [System.Windows.Forms.MessageBox]::Show("Choose or type a voice first.", "Slide Narrator") | Out-Null; return }
 
-    $settings = [pscustomobject]@{ Voice = "$($voiceBox.Text.Trim())"; Speed = $speed.Value; Video = $rbVideo.Checked; Resolution = "$($resBox.SelectedItem)"; FrameRate = "$($fpsBox.SelectedItem)"; Parallel = [int]$parallelBox.Value; Method = $methodBox.SelectedIndex; VideoParallel = [int]$videoParBox.Value; Chapters = $chapterBox.SelectedIndex }
+    $settings = [pscustomobject]@{ Voice = "$($voiceBox.Text.Trim())"; Speed = $speed.Value; Video = $rbVideo.Checked; Resolution = "$($resBox.SelectedItem)"; FrameRate = "$($fpsBox.SelectedItem)"; Parallel = [int]$parallelBox.Value; Method = $methodBox.SelectedIndex; VideoParallel = [int]$videoParBox.Value; Chapters = $chapterBox.SelectedIndex; AutoSlides = $autoSlides.Checked; AutoVideos = $autoVideos.Checked }
+    $vres = Choice-Value $script:ResChoices "$($resBox.SelectedItem)"; if (-not $vres) { $vres = 1080 }
+    $fps  = Choice-Value $script:FpsChoices "$($fpsBox.SelectedItem)"; if ($null -eq $fps) { $fps = 15 }
     $fast = $settings.Video -and ($methodBox.SelectedIndex -lt 2)
     if ($fast -and -not $script:Ffmpeg) {
         [System.Windows.Forms.MessageBox]::Show("The fast video method needs ffmpeg.exe, which wasn't found. PowerPoint will export the videos instead.", "Slide Narrator") | Out-Null
@@ -1241,21 +1367,24 @@ $start.Add_Click({
         if ($vres -eq 1440) { $vres = 1080 }
     }
     Save-Settings $settings
-    $vres = Choice-Value $script:ResChoices "$($resBox.SelectedItem)"; if (-not $vres) { $vres = 1080 }
-    $fps  = Choice-Value $script:FpsChoices "$($fpsBox.SelectedItem)"; if ($null -eq $fps) { $fps = 15 }
 
-    $script:Cancel = $false
+    $script:StopRequested = $false
     $controls = @($start, $browse, $removeBtn, $clearBtn, $fileList, $voiceBox, $preview, $testAll, $speed, $grp)
     foreach ($c in $controls) { $c.Enabled = $false }
     $cancel.Enabled = $true
     $form.AllowDrop = $false; $drop.AllowDrop = $false
     $log.Clear()
 
+    $slidesAtOnce = [int]$settings.Parallel
+    if ($settings.AutoSlides) { $slidesAtOnce = Get-AutoSlides $settings.Voice; $parallelBox.Value = $slidesAtOnce }
+    $videosAtOnce = [int]$settings.VideoParallel
+    if ($settings.AutoVideos) { $videosAtOnce = Get-AutoVideos $fast $fps $fileList.Items.Count; $videoParBox.Value = $videosAtOnce }
+
     $script:Run = [pscustomobject]@{
         Voice = $settings.Voice; Rate = $settings.Speed; Video = $settings.Video; VRes = $vres; Fps = $fps
-        Parallel = $settings.Parallel; Pause = 1; NoNotes = 4; Jobs = @(); DoneCount = 0
+        Parallel = $slidesAtOnce; Pause = 1; NoNotes = 4; Jobs = @(); DoneCount = 0
         Fast = $fast; Codec = $(if ($methodBox.SelectedIndex -eq 1) { "h265" } else { "h264" }); CodecName = $methodBox.Text
-        Videos = @(); VideoParallel = $settings.VideoParallel; Chapters = $settings.Chapters
+        Videos = @(); VideoParallel = $videosAtOnce; Chapters = $settings.Chapters
     }
     $decks = @()
     foreach ($p in @($fileList.Items)) {
@@ -1276,14 +1405,15 @@ $start.Add_Click({
         if (-not (Invoke-Speech "Checking." $pv $script:Run.Voice $script:Run.Rate)) {
             throw "The voice '$($script:Run.Voice)' isn't working. Try 'Test voices'. Reason: $($script:LastSpeechError)"
         }
-        $log.AppendText("Voice OK (engine: $($script:Engine)). Making audio $($script:Run.Parallel) slides at a time." + [Environment]::NewLine)
+        $log.AppendText("Voice OK (engine: $($script:Engine)). CPU: $($script:PhysicalCores) cores / $($script:LogicalCores) threads." + [Environment]::NewLine)
+        $log.AppendText("Slides at once: $($script:Run.Parallel)$(if ($settings.AutoSlides) { ' (auto)' })   Videos at once: $($script:Run.VideoParallel)$(if ($settings.AutoVideos) { ' (auto)' })" + [Environment]::NewLine)
 
         $ppt = New-Object -ComObject PowerPoint.Application
         $ppt.Visible = -1
 
         # 1. Read notes from every deck and queue the audio jobs
         foreach ($d in $decks) {
-            New-DeckLog $d.Log ([pscustomobject]@{ File = $d.Path; Voice = $settings.Voice; Speed = $settings.Speed; Video = $settings.Video; Resolution = $settings.Resolution; FrameRate = $settings.FrameRate; Method = $methodBox.Text; Parallel = $settings.Parallel })
+            New-DeckLog $d.Log ([pscustomobject]@{ File = $d.Path; Voice = $settings.Voice; Speed = $settings.Speed; Video = $settings.Video; Resolution = $settings.Resolution; FrameRate = $settings.FrameRate; Method = $methodBox.Text; SlidesAtOnce = $slidesAtOnce; VideosAtOnce = $videosAtOnce; Cores = "$($script:PhysicalCores)/$($script:LogicalCores)" })
             Log-To $d.Log "Reading notes: $($d.Name)"
             New-Item -ItemType Directory -Force -Path $d.WorkDir | Out-Null
             try {
@@ -1345,7 +1475,7 @@ $start.Add_Click({
         if ($ppt) { try { $ppt.Quit() } catch {}; try { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($ppt) } catch {} }
         $script:LogToFile = $false
         foreach ($c in $controls) { $c.Enabled = $true }
-        $resBox.Enabled = $rbVideo.Checked; $fpsBox.Enabled = $rbVideo.Checked; $methodBox.Enabled = $rbVideo.Checked; $videoParBox.Enabled = $rbVideo.Checked; $chapterBox.Enabled = $rbVideo.Checked
+        $resBox.Enabled = $rbVideo.Checked; $fpsBox.Enabled = $rbVideo.Checked; $methodBox.Enabled = $rbVideo.Checked; $videoParBox.Enabled = $rbVideo.Checked -and -not $autoVideos.Checked; $autoVideos.Enabled = $rbVideo.Checked; $chapterBox.Enabled = $rbVideo.Checked; $parallelBox.Enabled = -not $autoSlides.Checked
         $cancel.Enabled = $false
         $form.AllowDrop = $true; $drop.AllowDrop = $true
         $form.Text = "Slide Narrator"
