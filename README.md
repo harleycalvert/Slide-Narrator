@@ -24,10 +24,10 @@ Slide Narrator reads the speaker notes on every slide, voices them with a natura
 
 | File | Get it from | Needed? |
 |---|---|---|
-| `NaturalVoiceSAPIAdapter_v0.2.9_x86_x64.zip` | [github.com/gexgd0419/NaturalVoiceSAPIAdapter/releases](https://github.com/gexgd0419/NaturalVoiceSAPIAdapter/releases) | No, but strongly recommended |
-| `ms_natural_voice_en_au.zip` | [cross-plus-a.com/voice.htm](https://www.cross-plus-a.com/voice.htm) | No, but strongly recommended |
+| `NaturalVoiceSAPIAdapter_v0.2.9_x86_x64.zip` | [github.com/gexgd0419/NaturalVoiceSAPIAdapter/releases](https://github.com/gexgd0419/NaturalVoiceSAPIAdapter/releases) | Recommended (needed for natural voices) |
+| `ms_natural_voice_en_au.zip` | [cross-plus-a.com/voice.htm](https://www.cross-plus-a.com/voice.htm) | Recommended (offline Australian voices; needs the adapter) |
 | `balcon.zip` | [cross-plus-a.com/bconsole.htm](https://www.cross-plus-a.com/bconsole.htm) | Optional (backup speech engine) |
-| `ffmpeg.exe` | [ffmpeg.org/download.html](https://ffmpeg.org/download.html) | No, but strongly recommended |
+| `ffmpeg.exe` | [ffmpeg.org/download.html](https://ffmpeg.org/download.html) | Recommended (fast video, chapters, smaller files) |
 | `Slide-Narrator.ps1` and `Slide-Narrator.bat` | This repository | Required |
 
 Only the app is strictly required. Windows has basic built-in voices, but they sound robotic. For natural voices, install the adapter.
@@ -67,7 +67,21 @@ Slide-Narrator\
 3. Choose your output and video settings.
 4. Click **Start**.
 
-**Recommended video settings:** `Fast - ffmpeg H.264` · `4K / 2160p` · `1 per slide (VFR)`
+### Recommended settings (maximum performance and quality)
+
+| Setting | Use | Why |
+|---|---|---|
+| Video method | `Fast - ffmpeg H.264` | Fast, and plays everywhere |
+| Resolution | `4K / 2160p` | Sharpest result. With VFR, 4K costs very little extra time or file size. |
+| Frame rate | `1 per slide (VFR)` | Smallest files and quickest builds |
+| Slides at once | **The number of threads your CPU has**, as long as you have about **150 MB of free RAM per thread** (for example, 32 threads needs about 4.8 GB free) | Native voices run on your CPU, one slide per thread |
+| Videos at once | **The number of PowerPoint files**, up to about **5–8** | Each VFR video is light, so several build side by side. 5 at once has been tested and works well. |
+
+If you have less free RAM, lower **Slides at once** until it fits: free RAM in MB ÷ 150. **Online** voices are limited by Microsoft, not your CPU, so keep them at about 4 slides at once.
+
+To find your thread count, check the line `CPU: X cores / Y threads` in the app's log when it opens, or look in **Task Manager → Performance → CPU → Logical processors**.
+
+The **Auto** boxes choose sensible values for you. Untick them to enter the numbers above yourself.
 
 ## Output
 
@@ -84,11 +98,11 @@ Everything is saved next to each original deck:
 
 | Setting | Choices | Notes |
 |---|---|---|
-| Slides at once | 1–8 | How many slides are voiced in parallel. Use 6–8 for Native voices and about 4 for Online voices. |
+| Slides at once | 1–32, or Auto | How many slides are voiced in parallel. Native voices: up to one per CPU thread (about 150 MB of RAM each). Online voices: about 4. |
 | Video method | Fast - ffmpeg H.264 · Fast - ffmpeg H.265 · PowerPoint | H.264 plays everywhere. H.265 files are smaller, but some browsers can't play them. PowerPoint is the only method that keeps animations, but it's slow and does one video at a time. |
-| Resolution | 720p · 1080p · 1440p (ffmpeg only) · 4K | |
+| Resolution | 720p · 1080p · 1440p (ffmpeg only) · 4K | 4K is the default |
 | Frame rate | 1 per slide (VFR, ffmpeg only) · 5–60 fps | VFR gives the smallest files and is quickest to build. Every frame is a keyframe. |
-| Videos at once | 1–6 | Parallel ffmpeg video builds |
+| Videos at once | 1–12, or Auto | Parallel ffmpeg video builds. VFR: up to the number of decks (5–8 works well). Fixed frame rates: 1–2. |
 | Chapters | By section (or by slide) · By slide · None | |
 
 ### Pronunciation
