@@ -9,7 +9,8 @@
     1. reads and cleans the speaker notes
     2. makes the audio in the background, several slides at a time
        (Windows speech 64-bit, a 32-bit helper, or balcon.exe -
-       whichever works for the chosen voice), then converts it to AAC
+       whichever works for the chosen voice), sets every slide to the
+       same loudness, then converts it to AAC
     3. inserts the audio into the slide (plays automatically, icon
        hidden) and sets the slide to advance when the audio ends
   It saves  <deck>_narrated.pptx  next to the original (the original is
@@ -20,15 +21,22 @@
       the background, several videos at once. 720p to 4K, fixed frame
       rates or 1 frame per slide (VFR).
     - PowerPoint: PowerPoint's own export (keeps animations; slower).
-    - Chapters by section or by slide.
+    - Chapters by section or by slide, plus  <deck>_chapters.txt  ready
+      to paste into a YouTube description.
+    - Captions: subtitles inside the MP4, plus  <deck>.srt  and  <deck>.vtt
   Recommended: Fast - ffmpeg H.264, 4K, 1 per slide (VFR).
+
+  Progress: the right-hand side shows every deck (audio, video, status)
+  and everything being worked on right now (each slide being voiced, each
+  video being built, with percent and time left).
 
   Start it by double-clicking  Slide-Narrator.bat
   You can also drag .pptx files onto Slide-Narrator.bat.
 
   Needs: Windows 10/11, PowerPoint (Microsoft 365).
   Recommended: NaturalVoiceSAPIAdapter (natural voices),
-               ffmpeg.exe (AAC audio, fast video, chapters).
+               ffmpeg.exe (even volume, AAC audio, fast video, chapters,
+               captions).
   Optional:    balcon.exe (backup speech engine).
   Put ffmpeg.exe and a "balcon" subfolder next to this file.
   ------------------------------------------------------------------
@@ -46,14 +54,6 @@ Reset-ConsoleTitle
 
 $AppDir       = $PSScriptRoot
 $SettingsFile = Join-Path $AppDir "Slide-Narrator.settings.json"
-
-# ---------- Words to say differently (edit freely) ----------
-$Pronounce = [ordered]@{
-    "e.g." = "for example"; "i.e." = "that is"
-    "ISO"  = "I S O";  "PPE" = "P P E";  "OHS" = "O H S";  "WHS" = "W H S"
-    "HSRs" = "H S Rs"; "HSR" = "H S R";  "HSC" = "H S C";  "PCBU" = "P C B U"
-    "AT1"  = "A T 1";  "AT2" = "A T 2";  "MR"  = "M R";    "FER" = "F E R"; "SOC" = "S O C"
-}
 
 # ---------- Helpers ----------
 function Find-Balcon {
@@ -134,15 +134,6 @@ function Get-Voices([string]$balconPath) {
     return ,@($keep)
 }
 
-function Fix-Pronunciation([string]$text) {
-    foreach ($k in $Pronounce.Keys) {
-        $pattern = '(?<![A-Za-z])' + [regex]::Escape($k) + '(?![A-Za-z])'
-        $text = [regex]::Replace($text, $pattern, $Pronounce[$k])
-    }
-    return $text
-}
-
-
 # Clean text so speech engines don't choke on hidden characters
 function Clean-Text([string]$text) {
     $t = $text
@@ -157,6 +148,16 @@ function Clean-Text([string]$text) {
     $t = $t -replace '[<>]', ' '
     $t = $t -replace '[\x00-\x08\x0C\x0E-\x1F\x7F]', ''  # other control characters
     $t = $t -replace '[ \t]{2,}', ' '
+    return $t.Trim()
+}
+
+# Notes as they should appear in captions (no pronunciation changes)
+function Clean-Caption([string]$text) {
+    $t = $text -replace '[\u000B\r\n\t]+', ' '
+    $t = $t -replace '[\u00A0\u2007\u202F]', ' '
+    $t = $t -replace '[\u2022\u25AA\u25CF\u2023]', ''
+    $t = $t -replace '[\x00-\x08\x0C\x0E-\x1F\x7F]', ''
+    $t = $t -replace ' {2,}', ' '
     return $t.Trim()
 }
 
@@ -315,136 +316,423 @@ try { Set-Content -Path $script:Sapi32Helper -Value $helperCode -Encoding UTF8 }
 $script:VideoWorker = Join-Path $env:TEMP "slide-narrator-video.ps1"
 $videoWorkerCode = @'
 param([string]$JobFile)
-# Slide Narrator video worker: builds one MP4 from slide images + audio with ffmpeg
+# Slide Narrator video worker: builds one MP4 from slide images + audio with ffmpeg,
+# with chapters, a YouTube chapter list and captions. Mode "extras" adds chapters and
+# captions to an MP4 that PowerPoint has already exported.
 $ErrorActionPreference = "Continue"   # native tools write to stderr; we check exit codes instead
 $job = Get-Content -LiteralPath $JobFile -Raw | ConvertFrom-Json
 $log = $job.Log
+$inv = [Globalization.CultureInfo]::InvariantCulture
+$utf8 = New-Object System.Text.UTF8Encoding($false)
 # Progress file is read by the app while we write it: retry briefly, and never fail the job over it
 function SetProg([string]$v) {
+    if (-not $job.Progress) { return }
     for ($i = 0; $i -lt 40; $i++) {
         try { [IO.File]::WriteAllText($job.Progress, $v); return } catch { Start-Sleep -Milliseconds 50 }
     }
 }
+# Progress for the app: "stage|percent|seconds left" (-1 = not known yet)
+$script:Stage = "Starting"; $script:StageBase = 0.0; $script:StageSpan = 0.0
+$script:StageClock = [Diagnostics.Stopwatch]::StartNew()
+function Prog([string]$stage, [double]$frac, [double]$eta) {
+    $pct = [int][Math]::Max(0, [Math]::Min(99, [Math]::Floor($script:StageBase + $script:StageSpan * $frac)))
+    SetProg ("{0}|{1}|{2}" -f $stage, $pct, [int][Math]::Round($eta))
+}
+function Set-Stage([string]$name, [double]$base, [double]$span) {
+    $script:Stage = $name; $script:StageBase = $base; $script:StageSpan = $span
+    $script:StageClock.Restart(); Prog $name 0 -1
+}
+function Step-Prog {
+    if ($script:progTotal -le 0) { return }
+    $f = [Math]::Min(1.0, $script:doneCount / $script:progTotal); $eta = -1
+    if ($f -gt 0.05) { $eta = $script:StageClock.Elapsed.TotalSeconds * (1 - $f) / $f }
+    Prog $script:Stage $f $eta
+}
 function W([string]$m) { try { Add-Content -LiteralPath $log -Value ((Get-Date -Format "HH:mm:ss") + "  " + $m) -Encoding UTF8 } catch {} }
+function F3([double]$x) { return $x.ToString("0.###", $inv) }
+function Q2([string]$x) { return '"' + $x + '"' }
+function QList([string]$x) { return "file '" + ($x -replace "'", "'\''") + "'" }
+
+# ---- Small ffmpeg jobs, run several at once ----
+$script:threads = 4; if ($job.Threads) { $script:threads = [Math]::Max(1, [int]$job.Threads) }
+$script:running = New-Object System.Collections.ArrayList
+$script:doneCount = 0; $script:progTotal = 0; $script:Cues = @()
+function Wait-Slots([int]$max) {
+    while ($script:running.Count -ge $max) {
+        for ($k = $script:running.Count - 1; $k -ge 0; $k--) {
+            $pr = $script:running[$k]
+            if ($pr.P.HasExited) {
+                $bad = ($pr.P.ExitCode -ne 0) -or ($pr.Check -and -not (Test-Path -LiteralPath $pr.Check))
+                if ($bad) {
+                    $msg = "$($pr.What): " + $pr.P.StandardError.ReadToEnd()
+                    if ($pr.Soft) { W ("   note: " + $msg.Trim()) } else { throw $msg }
+                }
+                $script:running.RemoveAt($k); $script:doneCount++
+                Step-Prog
+            }
+        }
+        if ($script:running.Count -ge $max) { Start-Sleep -Milliseconds 50 }
+    }
+}
+function Start-Ff([string]$argLine, [string]$check, [string]$what, [bool]$soft) {
+    Wait-Slots $script:threads
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $job.Ffmpeg; $psi.Arguments = $argLine; $psi.WorkingDirectory = $job.WorkDir
+    $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; $psi.RedirectStandardError = $true
+    [void]$script:running.Add([pscustomobject]@{ P = [System.Diagnostics.Process]::Start($psi); Check = $check; What = $what; Soft = $soft })
+}
+
+# Run one long ffmpeg job, reporting its progress (ffmpeg's -progress file) as it goes
+function Join-Args($list) {
+    return (@($list | ForEach-Object { $x = [string]$_; if ($x -eq "" -or $x -match '[\s"]') { '"' + ($x -replace '"', '\"') + '"' } else { $x } }) -join ' ')
+}
+function Run-Ff($argList, [double]$total) {
+    $pf = Join-Path $job.WorkDir "encode-progress.txt"
+    Remove-Item -LiteralPath $pf -Force -ErrorAction SilentlyContinue
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $job.Ffmpeg; $psi.Arguments = (Join-Args (@("-progress", $pf, "-nostats") + @($argList)))
+    $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; $psi.RedirectStandardError = $true; $psi.WorkingDirectory = $job.WorkDir
+    $p = [System.Diagnostics.Process]::Start($psi)
+    $errTask = $p.StandardError.ReadToEndAsync()
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while (-not $p.WaitForExit(400)) {
+        if ($total -le 0) { continue }
+        $txt = ""
+        try {
+            $fs = [IO.File]::Open($pf, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+            try { $txt = (New-Object IO.StreamReader($fs)).ReadToEnd() } finally { $fs.Dispose() }
+        } catch {}
+        $m = [regex]::Matches($txt, 'out_time_(?:us|ms)=(\d+)')
+        if ($m.Count -gt 0) {
+            $f = [Math]::Min(1.0, ([double]$m[$m.Count - 1].Groups[1].Value / 1000000.0) / $total)
+            $eta = -1; if ($f -gt 0.03) { $eta = $sw.Elapsed.TotalSeconds * (1 - $f) / $f }
+            Prog $script:Stage $f $eta
+        }
+    }
+    $p.WaitForExit()
+    $err = [string]$errTask.Result
+    Remove-Item -LiteralPath $pf -Force -ErrorAction SilentlyContinue
+    return @{ Code = $p.ExitCode; Err = $err }
+}
+
+# ---- Captions ----
+# Find the pauses in every narrated slide (silencedetect, written to a small text file per slide)
+function Find-Pauses($segs) {
+    $map = @{}
+    foreach ($s in $segs) {
+        if (-not ($s.Wav -and $s.Caption)) { continue }
+        $f = "pauses_{0:D3}.txt" -f [int]$s.Index
+        Remove-Item -LiteralPath (Join-Path $job.WorkDir $f) -Force -ErrorAction SilentlyContinue
+        Start-Ff ("-hide_banner -nostats -loglevel error -i " + (Q2 $s.Wav) + " -af silencedetect=n=-40dB:d=0.15,ametadata=mode=print:file=$f -f null -") "" "slide $($s.Index) pauses" $true
+    }
+    Wait-Slots 1
+    foreach ($s in $segs) {
+        if (-not ($s.Wav -and $s.Caption)) { continue }
+        $f = Join-Path $job.WorkDir ("pauses_{0:D3}.txt" -f [int]$s.Index)
+        $list = @(); $st = $null
+        if (Test-Path -LiteralPath $f) {
+            foreach ($line in [IO.File]::ReadAllLines($f)) {
+                if ($line -match 'lavfi\.silence_start=(-?[\d.]+)') { $st = [Math]::Max(0.0, [double]::Parse($matches[1], $inv)) }
+                elseif ($line -match 'lavfi\.silence_end=([\d.]+)' -and $null -ne $st) {
+                    $list += [pscustomobject]@{ S = $st; E = [double]::Parse($matches[1], $inv) }; $st = $null
+                }
+            }
+            Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue
+        }
+        if ($null -ne $st) { $list += [pscustomobject]@{ S = $st; E = [double]$s.WavDur } }
+        $map[[int]$s.Index] = $list
+    }
+    return $map
+}
+
+# Split a slide's text into caption-sized pieces (max ~84 characters, 2 lines of ~42)
+function Split-Caption([string]$text) {
+    $t = ($text -replace '\s+', ' ').Trim()
+    $out = New-Object System.Collections.Generic.List[string]
+    if (-not $t) { return ,$out }
+    foreach ($sen in [regex]::Split($t, '(?<=[.!?]["\x27\u201D\u2019)\]]?)\s+')) {
+        if (-not $sen) { continue }
+        if ($sen.Length -le 84) { $out.Add($sen); continue }
+        $cur = ""
+        foreach ($w in ($sen -split ' ')) {
+            if ($cur -and ($cur.Length + 1 + $w.Length) -gt 84) { $out.Add($cur); $cur = $w }
+            elseif ($cur) { $cur = "$cur $w" } else { $cur = $w }
+            if ($cur.Length -ge 40 -and $cur -match '[,;:]$') { $out.Add($cur); $cur = "" }
+        }
+        if ($cur) {
+            # Don't leave a tiny piece on its own
+            if ($cur.Length -lt 15 -and $out.Count -gt 0 -and ($out[$out.Count - 1].Length + 1 + $cur.Length) -le 100) { $out[$out.Count - 1] += " $cur" }
+            else { $out.Add($cur) }
+        }
+    }
+    return ,$out
+}
+function Wrap-Caption([string]$c) {
+    if ($c.Length -le 42) { return $c }
+    $mid = [int]($c.Length / 2); $best = -1
+    for ($d = 0; $d -lt $mid; $d++) {
+        if ($mid + $d -lt $c.Length -and $c[$mid + $d] -eq ' ') { $best = $mid + $d; break }
+        if ($mid - $d -ge 0 -and $c[$mid - $d] -eq ' ') { $best = $mid - $d; break }
+    }
+    if ($best -lt 0) { return $c }
+    return $c.Substring(0, $best) + "`n" + $c.Substring($best + 1)
+}
+
+# Time one slide's captions: share the speech between the pieces by length, then
+# line each break up with a real pause in the audio when there is one nearby
+function Get-SlideCues($s, [double]$offset, [double]$slideLen, $pauses) {
+    $cues = @()
+    $chunks = Split-Caption ([string]$s.Caption)
+    if ($chunks.Count -eq 0) { return $cues }
+    $wd = [double]$s.WavDur
+    $s0 = 0.0; $s1 = $wd; $inner = @()
+    foreach ($p in @($pauses)) {
+        if ($p.S -le 0.05) { $s0 = [Math]::Max($s0, $p.E); continue }      # silence before the speech
+        if ($p.E -ge $wd - 0.05) { $s1 = [Math]::Min($s1, $p.S); continue } # silence after it
+        $inner += $p
+    }
+    if ($s1 -le $s0 + 0.2) { $s0 = 0.0; $s1 = $wd }
+    $w = @(); foreach ($c in $chunks) { $w += ($c.Length + 4) }
+    $total = 0.0; foreach ($x in $w) { $total += $x }
+    $starts = @($s0); $ends = @()
+    $anchorT = $s0; $anchorW = 0.0; $cum = 0.0; $next = 0
+    for ($k = 0; $k -lt $chunks.Count - 1; $k++) {
+        $cum += $w[$k]
+        $est = $anchorT + ($cum - $anchorW) / [Math]::Max(1.0, $total - $anchorW) * ($s1 - $anchorT)
+        $win = [Math]::Max(0.8, 0.35 * ($est - $starts[$k]))
+        $pick = -1; $bestD = 1e9
+        for ($m = $next; $m -lt $inner.Count; $m++) {
+            $mid = ($inner[$m].S + $inner[$m].E) / 2
+            if ($inner[$m].S -le $starts[$k] + 0.3) { continue }
+            $dd = [Math]::Abs($mid - $est)
+            if ($dd -le $win -and $dd -lt $bestD) { $bestD = $dd; $pick = $m }
+            if ($mid -gt $est + $win) { break }
+        }
+        if ($pick -ge 0) {
+            $ends += $inner[$pick].S; $starts += $inner[$pick].E; $next = $pick + 1
+            $anchorT = $inner[$pick].E; $anchorW = $cum
+        } else {
+            $ends += $est; $starts += $est
+        }
+    }
+    $ends += $s1
+    for ($k = 0; $k -lt $chunks.Count; $k++) {
+        $a = $starts[$k]; $b = $ends[$k]
+        # Keep a caption up through short pauses; hold the last one a moment after speech ends
+        if ($k + 1 -lt $chunks.Count) { if ($starts[$k + 1] - $b -lt 1.0) { $b = $starts[$k + 1] } else { $b += 0.5 } }
+        else { $b = [Math]::Min($b + 0.5, $slideLen) }
+        if ($b -lt $a + 0.5) { $b = [Math]::Min($a + 0.5, $slideLen) }
+        if ($b -le $a) { continue }
+        $cues += [pscustomobject]@{ Start = $offset + $a; End = $offset + $b; Text = (Wrap-Caption $chunks[$k]) }
+    }
+    return $cues
+}
+
+function Format-CueTime([double]$t, [string]$sep) {
+    $ms = [long][Math]::Round($t * 1000)
+    $h = [long][Math]::Floor($ms / 3600000); $ms -= $h * 3600000
+    $m = [long][Math]::Floor($ms / 60000);   $ms -= $m * 60000
+    $sec = [long][Math]::Floor($ms / 1000);  $ms -= $sec * 1000
+    return ("{0:00}:{1:00}:{2:00}{3}{4:000}" -f $h, $m, $sec, $sep, $ms)
+}
+
+# Build captions for the whole video; writes <video>.srt and <video>.vtt. Returns the .srt path or "".
+function Write-Captions($segs, $startsArr, $lensArr) {
+    if (-not $job.Captions) { return "" }
+    try {
+        $pauses = Find-Pauses $segs
+        $cues = @()
+        for ($k = 0; $k -lt $segs.Count; $k++) {
+            $s = $segs[$k]
+            if (-not ($s.Wav -and $s.Caption)) { continue }
+            $cues += Get-SlideCues $s $startsArr[$k] $lensArr[$k] $pauses[[int]$s.Index]
+        }
+        $script:Cues = $cues
+        if ($cues.Count -eq 0) { return "" }
+        $base = [IO.Path]::Combine([IO.Path]::GetDirectoryName($job.Out), [IO.Path]::GetFileNameWithoutExtension($job.Out))
+        $srt = @(); $vtt = @("WEBVTT", ""); $n = 0
+        foreach ($c in $cues) {
+            $n++
+            $srt += @("$n", ((Format-CueTime $c.Start ",") + " --> " + (Format-CueTime $c.End ",")), $c.Text, "")
+            $vtt += @(((Format-CueTime $c.Start ".") + " --> " + (Format-CueTime $c.End ".")), $c.Text, "")
+        }
+        [IO.File]::WriteAllText("$base.srt", (($srt -join "`r`n") -replace "(?<!`r)`n", "`r`n"), $utf8)
+        [IO.File]::WriteAllText("$base.vtt", ($vtt -join "`n"), $utf8)
+        W "Captions: $($cues.Count) captions saved as $([IO.Path]::GetFileName($base)).srt and .vtt"
+        return "$base.srt"
+    } catch { W ("Captions skipped: " + $_.Exception.Message); return "" }
+}
+
+# Chapters: FFMETADATA for the MP4, plus <video>_chapters.txt ready to paste into a YouTube description
+function Write-Chapters($chapters, [double]$clock) {
+    if ($chapters.Count -eq 0) { return "" }
+    $meta = Join-Path $job.WorkDir "chapters.txt"
+    $ml = @(";FFMETADATA1"); $yt = @()
+    for ($c = 0; $c -lt $chapters.Count; $c++) {
+        $st = [long][Math]::Round($chapters[$c].Start * 1000)
+        $en = if ($c + 1 -lt $chapters.Count) { [long][Math]::Round($chapters[$c + 1].Start * 1000) } else { [long][Math]::Round($clock * 1000) }
+        $title = ([string]$chapters[$c].Title -replace '[\r\n\v]+', ' ').Trim()
+        $ml += @("[CHAPTER]", "TIMEBASE=1/1000", "START=$st", "END=$en", ("title=" + ($title -replace '([\\=;#])', '\$1')))
+        $sec = if ($c -eq 0) { 0 } else { [long][Math]::Floor($chapters[$c].Start) }   # YouTube needs the first at 0:00
+        $hh = [long][Math]::Floor($sec / 3600); $mm = [long][Math]::Floor(($sec % 3600) / 60); $ss = $sec % 60
+        $stamp = if ($clock -ge 3600) { "{0}:{1:00}:{2:00}" -f $hh, $mm, $ss } else { "{0}:{1:00}" -f $mm, $ss }
+        $yt += "$stamp $title"
+    }
+    [IO.File]::WriteAllLines($meta, $ml, $utf8)
+    try {
+        $base = [IO.Path]::Combine([IO.Path]::GetDirectoryName($job.Out), [IO.Path]::GetFileNameWithoutExtension($job.Out))
+        [IO.File]::WriteAllLines("${base}_chapters.txt", $yt, $utf8)
+        $short = 0
+        for ($c = 0; $c -lt $chapters.Count; $c++) {
+            $en = if ($c + 1 -lt $chapters.Count) { $chapters[$c + 1].Start } else { $clock }
+            if ($en - $chapters[$c].Start -lt 10) { $short++ }
+        }
+        $msg = "Chapter list for YouTube saved: $([IO.Path]::GetFileName($base))_chapters.txt"
+        if ($chapters.Count -lt 3) { $msg += " (YouTube needs at least 3 chapters to show them)" }
+        elseif ($short -gt 0) { $msg += " (YouTube needs each chapter to be 10 s or longer; $short are shorter)" }
+        W $msg
+    } catch { W ("Chapter list skipped: " + $_.Exception.Message) }
+    return $meta
+}
+
+# Extra inputs and maps for chapters and captions, starting at input number $first
+function Get-Extras([string]$meta, [string]$srt, [int]$first) {
+    $in = @(); $map = @(); $i = $first
+    if ($meta) { $in += @("-i", $meta); $map += @("-map_metadata", "$i", "-map_chapters", "$i"); $i++ }
+    if ($srt)  { $in += @("-sub_charenc", "UTF-8", "-i", $srt); $map += @("-map", "$($i):s", "-c:s", "mov_text", "-metadata:s:s:0", "language=eng", "-metadata:s:s:0", "handler_name=English"); $i++ }
+    return @{ In = $in; Map = $map }
+}
+
 try {
     $ff = $job.Ffmpeg; $fps = [int]$job.Fps
-    if ($job.Codec -eq "h265") { $vc = @("-c:v", "libx265", "-preset", "medium", "-crf", "26", "-x265-params", "log-level=error") }
+    $segs = @($job.Segments)
+    if ($job.Codec -eq "h265") { $vc = @("-c:v", "libx265", "-preset", "medium", "-crf", "26", "-forced-idr", "1", "-x265-params", "log-level=error") }
     else                       { $vc = @("-c:v", "libx264", "-preset", "medium", "-crf", "22", "-tune", "stillimage") }
+
+    # Where each slide starts and how long it lasts in the finished video
+    $starts = @(); $lens = @(); $clock = 0.0; $chapters = @()
+    foreach ($s in $segs) {
+        if ($job.Mode -ne "extras" -and $fps -gt 0) {
+            $frames = [Math]::Max(1, [Math]::Ceiling([double]$s.Dur * $fps - 0.000001))   # whole frames
+            $secs = $frames / $fps
+        } else { $secs = [Math]::Round([double]$s.Dur, 3) }
+        if ($s.Chapter) { $chapters += [pscustomobject]@{ Title = [string]$s.Chapter; Start = $clock } }
+        $starts += $clock; $lens += $secs; $clock += $secs
+    }
+    $withPauses = 0; if ($job.Captions) { $withPauses = @($segs | Where-Object { $_.Wav -and $_.Caption }).Count }
+
+    if ($job.Mode -eq "extras") {
+        # ---- Add chapters and captions to a video PowerPoint has already made ----
+        $script:progTotal = $withPauses
+        Set-Stage "Timing captions" 0 50
+        $srt = Write-Captions $segs $starts $lens
+        $meta = Write-Chapters $chapters $clock
+        if (-not $srt -and -not $meta) { SetProg "done"; exit 0 }
+        $ex = Get-Extras $meta $srt 1
+        $tmp = [IO.Path]::ChangeExtension($job.Out, ".extras.mp4")
+        $a = @("-y", "-loglevel", "error", "-i", $job.Out) + $ex.In + @("-map", "0:v", "-map", "0:a") + $ex.Map + @("-c:v", "copy", "-c:a", "copy", "-movflags", "+faststart", $tmp)
+        Set-Stage "Adding to video" 50 50
+        $res = Run-Ff $a $clock
+        if ($res.Code -ne 0 -or -not (Test-Path -LiteralPath $tmp)) { throw "adding chapters/captions: " + $res.Err.Trim() }
+        Move-Item -LiteralPath $tmp -Destination $job.Out -Force
+        W "Added $(if ($meta) { "$($chapters.Count) chapters" })$(if ($meta -and $srt) { ' and ' })$(if ($srt) { 'captions' }) to the video."
+        SetProg "done"; exit 0
+    }
+
     if ($fps -le 0) {
         # ---- One frame per slide (variable frame rate) ----
-        $total = @($job.Segments).Count; $n = 0; $clock = 0.0; $chapters = @()
+        $script:progTotal = $segs.Count + $withPauses
+        Set-Stage "Preparing audio" 0 8
         $imgLines = @(); $audLines = @(); $pads = @()
         # Prepare each slide's audio in parallel (one small ffmpeg per slide)
-        $threads = 4; if ($job.Threads) { $threads = [Math]::Max(1, [int]$job.Threads) }
-        $q2 = { param($x) '"' + $x + '"' }
-        $running = New-Object System.Collections.ArrayList
-        $doneCount = 0
-        function Wait-Slots([int]$max) {
-            while ($running.Count -ge $max) {
-                for ($k = $running.Count - 1; $k -ge 0; $k--) {
-                    $pr = $running[$k]
-                    if ($pr.P.HasExited) {
-                        if ($pr.P.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $pr.Pad)) { throw "slide $($pr.Index) audio: " + $pr.P.StandardError.ReadToEnd() }
-                        $running.RemoveAt($k); $script:doneCount++
-                        SetProg "$($script:doneCount)/$total"
-                    }
-                }
-                if ($running.Count -ge $max) { Start-Sleep -Milliseconds 50 }
-            }
-        }
-        foreach ($s in $job.Segments) {
-            $n++
-            $secs = [Math]::Round([double]$s.Dur, 3)
-            if ($s.Chapter) { $chapters += [pscustomobject]@{ Title = [string]$s.Chapter; Start = $clock } }
-            $clock += $secs
-            $dur = $secs.ToString("0.###", [Globalization.CultureInfo]::InvariantCulture)
-            $pad = Join-Path $job.WorkDir ("pad_{0:D3}.wav" -f $n)
-            if ($s.Wav) { $argLine = "-y -loglevel error -i " + (& $q2 $s.Wav) + " -af apad -t $dur -ar 48000 -ac 1 -c:a pcm_s16le " + (& $q2 $pad) }
-            else        { $argLine = "-y -loglevel error -f lavfi -i anullsrc=r=48000:cl=mono -t $dur -c:a pcm_s16le " + (& $q2 $pad) }
-            Wait-Slots $threads
-            $psi = New-Object System.Diagnostics.ProcessStartInfo
-            $psi.FileName = $ff; $psi.Arguments = $argLine
-            $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; $psi.RedirectStandardError = $true
-            [void]$running.Add([pscustomobject]@{ P = [System.Diagnostics.Process]::Start($psi); Pad = $pad; Index = $s.Index })
+        for ($k = 0; $k -lt $segs.Count; $k++) {
+            $s = $segs[$k]
+            $dur = F3 $lens[$k]
+            $pad = Join-Path $job.WorkDir ("pad_{0:D3}.wav" -f ($k + 1))
+            if ($s.Wav) { $argLine = "-y -loglevel error -i " + (Q2 $s.Wav) + " -af apad -t $dur -ar 48000 -ac 1 -c:a pcm_s16le " + (Q2 $pad) }
+            else        { $argLine = "-y -loglevel error -f lavfi -i anullsrc=r=48000:cl=mono -t $dur -c:a pcm_s16le " + (Q2 $pad) }
+            Start-Ff $argLine $pad "slide $($s.Index) audio" $false
             $pads += $pad
-            $q = { param($x) "file '" + ($x -replace "'", "'\''") + "'" }
-            $imgLines += (& $q $s.Img); $imgLines += "duration $dur"
-            $audLines += (& $q $pad)
+            $audLines += (QList $pad)
         }
-        Wait-Slots 1   # wait for all audio pieces to finish
-        $imgLines += (& $q (@($job.Segments)[-1].Img))      # concat quirk: repeat the last picture
-        $utf8 = New-Object System.Text.UTF8Encoding($false)
-        $imgList = Join-Path $job.WorkDir "images.txt"; [IO.File]::WriteAllLines($imgList, $imgLines, $utf8)
-        $audList = Join-Path $job.WorkDir "audio.txt";  [IO.File]::WriteAllLines($audList, $audLines, $utf8)
-        $a = @("-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", $imgList, "-f", "concat", "-safe", "0", "-i", $audList)
-        $map = @("-map", "0:v", "-map", "1:a")
-        if ($chapters.Count -gt 0) {
-            $meta = Join-Path $job.WorkDir "chapters.txt"
-            $ml = @(";FFMETADATA1")
-            for ($c = 0; $c -lt $chapters.Count; $c++) {
-                $st = [long][Math]::Round($chapters[$c].Start * 1000)
-                $en = if ($c + 1 -lt $chapters.Count) { [long][Math]::Round($chapters[$c + 1].Start * 1000) } else { [long][Math]::Round($clock * 1000) }
-                $tt = ($chapters[$c].Title -replace '[\r\n]+', ' ') -replace '([\\=;#])', '\$1'
-                $ml += @("[CHAPTER]", "TIMEBASE=1/1000", "START=$st", "END=$en", "title=$tt")
+        Wait-Slots 1                                  # all audio pieces finished
+        $srt = Write-Captions $segs $starts $lens
+        # Players draw captions onto video frames, so repeat the slide's picture wherever a caption
+        # starts or ends. The repeats are "no change" frames, so they add almost nothing to the size.
+        $cuts = @()
+        foreach ($c in $script:Cues) { $cuts += [Math]::Round($c.Start, 3); $cuts += [Math]::Round($c.End, 3) }
+        $cuts = @($cuts | Sort-Object -Unique)
+        $keys = @()
+        for ($k = 0; $k -lt $segs.Count; $k++) {
+            $a0 = [Math]::Round($starts[$k], 3); $b0 = [Math]::Round($starts[$k] + $lens[$k], 3); $prev = $a0
+            $keys += F3 ([Math]::Max(0.0, $a0 - 0.005))           # keyframe at every slide start
+            foreach ($t in $cuts) {
+                if ($t -gt $prev + 0.04 -and $t -lt $b0 - 0.04) {
+                    $imgLines += (QList $segs[$k].Img); $imgLines += ("duration " + (F3 ($t - $prev))); $prev = $t
+                }
             }
-            [IO.File]::WriteAllLines($meta, $ml, $utf8)
-            $a += @("-i", $meta); $map += @("-map_metadata", "2", "-map_chapters", "2")
+            $imgLines += (QList $segs[$k].Img); $imgLines += ("duration " + (F3 ($b0 - $prev)))
         }
-        $vcv = $vc + @("-g", "1", "-pix_fmt", "yuv420p")
-        $tail = @("-c:a", "aac", "-b:a", "64k", "-t", $clock.ToString("0.###", [Globalization.CultureInfo]::InvariantCulture), "-movflags", "+faststart")
+        $imgLines += (QList $segs[-1].Img)      # concat quirk: repeat the last picture
+        # Millisecond timing for each picture (needs ffmpeg 5 or later; older versions use the plain list)
+        $precise = @(); foreach ($l in $imgLines) { $precise += $l; if ($l -like "file *") { $precise += "option framerate 1000" } }
+        $imgList = Join-Path $job.WorkDir "images.txt"; [IO.File]::WriteAllLines($imgList, $precise, $utf8)
+        $imgPlain = Join-Path $job.WorkDir "images-plain.txt"; [IO.File]::WriteAllLines($imgPlain, $imgLines, $utf8)
+        $audList = Join-Path $job.WorkDir "audio.txt";  [IO.File]::WriteAllLines($audList, $audLines, $utf8)
+        $meta = Write-Chapters $chapters $clock
+        $ex = Get-Extras $meta $srt 2
+        $a = @("-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", $imgList, "-f", "concat", "-safe", "0", "-i", $audList) + $ex.In
+        $map = @("-map", "0:v", "-map", "1:a") + $ex.Map
+        # Fixed quality for each slide's picture (same quality as before captions), and the repeated
+        # pictures get almost no data: they copy the previous frame exactly
+        if ($job.Codec -eq "h265") { $vcv = @("-c:v", "libx265", "-preset", "medium", "-forced-idr", "1", "-x265-params", "log-level=error:qp=51:ipratio=8") }
+        else                       { $vcv = @("-c:v", "libx264", "-preset", "medium", "-tune", "stillimage", "-qp", "39", "-x264-params", "ipratio=8") }
+        $vcv += @("-g", "100000", "-force_key_frames", ($keys -join ","), "-pix_fmt", "yuv420p")
+        $tail = @("-c:a", "aac", "-b:a", "64k", "-t", (F3 $clock), "-movflags", "+faststart")
         if ($job.Codec -eq "h265") { $tail += @("-tag:v", "hvc1") }
-        $out = & $ff @($a + $map + $vcv + @("-fps_mode", "vfr") + $tail + @($job.Out)) 2>&1
-        if ($LASTEXITCODE -ne 0) {   # older ffmpeg: -vsync instead of -fps_mode
-            $out = & $ff @($a + $map + $vcv + @("-vsync", "vfr") + $tail + @($job.Out)) 2>&1
+        Set-Stage "Encoding" 8 92
+        $res = Run-Ff @($a + $map + $vcv + @("-fps_mode", "vfr") + $tail + @($job.Out)) $clock
+        if ($res.Code -ne 0) {   # older ffmpeg: -vsync instead of -fps_mode, no per-picture options
+            W ("   note: retrying for an older ffmpeg: " + $res.Err.Trim())
+            $a = @($a | ForEach-Object { if ($_ -eq $imgList) { $imgPlain } else { $_ } })
+            Set-Stage "Encoding" 8 92
+            $res = Run-Ff @($a + $map + $vcv + @("-vsync", "vfr") + $tail + @($job.Out)) $clock
         }
-        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $job.Out)) { throw "building video: " + (($out | Out-String).Trim()) }
+        if ($res.Code -ne 0 -or -not (Test-Path -LiteralPath $job.Out)) { throw "building video: " + $res.Err.Trim() }
         foreach ($pd in $pads) { Remove-Item -LiteralPath $pd -Force -ErrorAction SilentlyContinue }
         SetProg "done"
         exit 0
     }
 
-    $segs = @(); $n = 0; $total = @($job.Segments).Count
-    $clock = 0.0; $chapters = @()
-    foreach ($s in $job.Segments) {
-        $n++
-        $seg = Join-Path $job.WorkDir ("seg_{0:D3}.mkv" -f $n)
-        # Round each slide to whole video frames so chapter times line up exactly
-        $frames = [Math]::Max(1, [Math]::Ceiling([double]$s.Dur * $fps - 0.000001))
-        $secs = $frames / $fps
-        if ($s.Chapter) { $chapters += [pscustomobject]@{ Title = [string]$s.Chapter; Start = $clock } }
-        $clock += $secs
-        $dur = ([double]$secs).ToString("0.######", [Globalization.CultureInfo]::InvariantCulture)
+    # ---- Fixed frame rate: one short clip per slide, then join them ----
+    $script:progTotal = $segs.Count + $withPauses
+    Set-Stage "Encoding slides" 0 95
+    $srt = Write-Captions $segs $starts $lens
+    $clips = @()
+    for ($k = 0; $k -lt $segs.Count; $k++) {
+        $s = $segs[$k]
+        $seg = Join-Path $job.WorkDir ("seg_{0:D3}.mkv" -f ($k + 1))
+        $dur = ([double]$lens[$k]).ToString("0.######", $inv)
         $a = @("-y", "-loglevel", "error", "-loop", "1", "-framerate", "$fps", "-i", $s.Img)
         if ($s.Wav) { $a += @("-i", $s.Wav, "-af", "apad") } else { $a += @("-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono") }
         $a += @("-t", $dur) + $vc + @("-pix_fmt", "yuv420p", "-r", "$fps", "-c:a", "pcm_s16le", "-ar", "48000", "-ac", "1", $seg)
         $out = & $ff @a 2>&1
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $seg)) { throw "slide $($s.Index): " + (($out | Out-String).Trim()) }
-        $segs += $seg
-        SetProg "$n/$total"
+        $clips += $seg
+        $script:doneCount++; Step-Prog
     }
     $list = Join-Path $job.WorkDir "segments.txt"
-    $lines = $segs | ForEach-Object { "file '" + ($_ -replace "'", "'\''") + "'" }
-    [IO.File]::WriteAllLines($list, $lines, (New-Object System.Text.UTF8Encoding($false)))
-    $a = @("-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", $list)
-    if ($chapters.Count -gt 0) {
-        # Chapter markers (FFMETADATA format)
-        $meta = Join-Path $job.WorkDir "chapters.txt"
-        $ml = @(";FFMETADATA1")
-        for ($c = 0; $c -lt $chapters.Count; $c++) {
-            $st = [long][Math]::Round($chapters[$c].Start * 1000)
-            $en = if ($c + 1 -lt $chapters.Count) { [long][Math]::Round($chapters[$c + 1].Start * 1000) } else { [long][Math]::Round($clock * 1000) }
-            $tt = ($chapters[$c].Title -replace '[\r\n]+', ' ') -replace '([\\=;#])', '\$1'
-            $ml += @("[CHAPTER]", "TIMEBASE=1/1000", "START=$st", "END=$en", "title=$tt")
-        }
-        [IO.File]::WriteAllLines($meta, $ml, (New-Object System.Text.UTF8Encoding($false)))
-        $a += @("-i", $meta, "-map", "0:v", "-map", "0:a", "-map_metadata", "1", "-map_chapters", "1")
-    }
+    [IO.File]::WriteAllLines($list, @($clips | ForEach-Object { QList $_ }), $utf8)
+    $meta = Write-Chapters $chapters $clock
+    $ex = Get-Extras $meta $srt 1
+    $a = @("-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", $list) + $ex.In + @("-map", "0:v", "-map", "0:a") + $ex.Map
     $a += @("-c:v", "copy", "-c:a", "aac", "-b:a", "64k", "-movflags", "+faststart")
     if ($job.Codec -eq "h265") { $a += @("-tag:v", "hvc1") }
     $a += $job.Out
-    $out = & $ff @a 2>&1
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $job.Out)) { throw "joining: " + (($out | Out-String).Trim()) }
-    foreach ($sg in $segs) { Remove-Item -LiteralPath $sg -Force -ErrorAction SilentlyContinue }
+    Set-Stage "Joining" 95 5
+    $res = Run-Ff $a $clock
+    if ($res.Code -ne 0 -or -not (Test-Path -LiteralPath $job.Out)) { throw "joining: " + $res.Err.Trim() }
+    foreach ($sg in $clips) { Remove-Item -LiteralPath $sg -Force -ErrorAction SilentlyContinue }
     SetProg "done"
     exit 0
 } catch {
@@ -545,7 +833,7 @@ function Save-Settings($obj) {
 # ---------- Build the window ----------
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "Slide Narrator"
-$form.Size = New-Object System.Drawing.Size(640, 744)
+$form.Size = New-Object System.Drawing.Size(1170, 774)
 $form.StartPosition = "CenterScreen"
 $form.Font = New-Object System.Drawing.Font("Segoe UI", 10)
 $form.AllowDrop = $true
@@ -642,20 +930,20 @@ $form.Controls.Add($speed)
 $grp = New-Object System.Windows.Forms.GroupBox
 $grp.Text = "Output"
 $grp.Location = New-Object System.Drawing.Point(20, 245)
-$grp.Size = New-Object System.Drawing.Size(585, 159)
+$grp.Size = New-Object System.Drawing.Size(585, 189)
 $form.Controls.Add($grp)
 
 $rbDeck = New-Object System.Windows.Forms.RadioButton
 $rbDeck.Text = "Narrated PowerPoint only"
 $rbDeck.Location = New-Object System.Drawing.Point(15, 25)
 $rbDeck.AutoSize = $true
-$rbDeck.Checked = $true
 $grp.Controls.Add($rbDeck)
 
 $rbVideo = New-Object System.Windows.Forms.RadioButton
 $rbVideo.Text = "Narrated PowerPoint + MP4 video"
 $rbVideo.Location = New-Object System.Drawing.Point(15, 55)
 $rbVideo.AutoSize = $true
+$rbVideo.Checked = $true                         # default: PowerPoint + video
 $grp.Controls.Add($rbVideo)
 
 $lblRes = New-Object System.Windows.Forms.Label
@@ -719,11 +1007,13 @@ if ($script:PhysicalCores -lt 1) { $script:PhysicalCores = $script:LogicalCores 
 $script:TotalMemMB = 8192
 try { $script:TotalMemMB = [int]((Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).TotalPhysicalMemory / 1MB) } catch {}
 
-# Slides voiced at once: Online voices are limited by Microsoft, Native voices by cores and memory
+# Slides voiced at once: Online voices are limited by Microsoft, Native voices by CPU threads and memory
 function Get-AutoSlides([string]$voice) {
     if ($voice -match 'Online') { return 4 }
-    $byMem = [int][Math]::Floor(($script:TotalMemMB / 2) / 250)     # use at most half the RAM, ~250 MB per voice
-    return [Math]::Max(2, [Math]::Min(32, [Math]::Min($script:PhysicalCores, $byMem)))
+    # One slide per CPU thread: each voice is single-threaded, so hyper-threads add real throughput.
+    # Capped so the voices use at most half the RAM, at ~150 MB each.
+    $byMem = [int][Math]::Floor(($script:TotalMemMB / 2) / 150)
+    return [Math]::Max(2, [Math]::Min(32, [Math]::Min($script:LogicalCores, $byMem)))
 }
 # Videos built at once: VFR jobs are light; fixed-frame-rate encodes already use most cores
 function Get-AutoVideos([bool]$fast, [int]$fps, [int]$decks) {
@@ -806,6 +1096,13 @@ $chapterBox.Size = New-Object System.Drawing.Size(200, 28)
 $chapterBox.SelectedIndex = 0
 $grp.Controls.Add($chapterBox)
 
+$captionBox = New-Object System.Windows.Forms.CheckBox
+$captionBox.Text = "Captions (subtitles in the video, plus .srt and .vtt files)"
+$captionBox.Location = New-Object System.Drawing.Point(15, 155)
+$captionBox.AutoSize = $true
+$captionBox.Checked = $true
+$grp.Controls.Add($captionBox)
+
 function Update-VideoChoices($wantRes, $wantFps) {
     $ff = $methodBox.SelectedIndex -lt 2
     Fill-Choices $resBox $script:ResChoices $ff $wantRes "4K / 2160p"
@@ -817,7 +1114,7 @@ $methodBox.Add_SelectedIndexChanged({ Update-VideoChoices $null $null })
 # Start / Cancel
 $start = New-Object System.Windows.Forms.Button
 $start.Text = "Start"
-$start.Location = New-Object System.Drawing.Point(20, 416)
+$start.Location = New-Object System.Drawing.Point(20, 446)
 $start.Size = New-Object System.Drawing.Size(470, 40)
 $start.BackColor = $navy
 $start.ForeColor = [System.Drawing.Color]::White
@@ -827,7 +1124,7 @@ $form.Controls.Add($start)
 
 $cancel = New-Object System.Windows.Forms.Button
 $cancel.Text = "Cancel"
-$cancel.Location = New-Object System.Drawing.Point(500, 416)
+$cancel.Location = New-Object System.Drawing.Point(500, 446)
 $cancel.Size = New-Object System.Drawing.Size(105, 40)
 $cancel.Enabled = $false
 $form.Controls.Add($cancel)
@@ -835,31 +1132,192 @@ $form.Controls.Add($cancel)
 # Progress + log
 $lblAudio = New-Object System.Windows.Forms.Label
 $lblAudio.Text = "Audio: -"
-$lblAudio.Location = New-Object System.Drawing.Point(20, 461)
+$lblAudio.Location = New-Object System.Drawing.Point(20, 491)
 $lblAudio.Size = New-Object System.Drawing.Size(280, 20)
 $lblAudio.Font = New-Object System.Drawing.Font("Segoe UI", 9)
 $form.Controls.Add($lblAudio)
 
 $lblVideo = New-Object System.Windows.Forms.Label
 $lblVideo.Text = "Video: -"
-$lblVideo.Location = New-Object System.Drawing.Point(300, 461)
+$lblVideo.Location = New-Object System.Drawing.Point(300, 491)
 $lblVideo.Size = New-Object System.Drawing.Size(305, 20)
 $lblVideo.Font = New-Object System.Drawing.Font("Segoe UI", 9)
 $form.Controls.Add($lblVideo)
 
 $progress = New-Object System.Windows.Forms.ProgressBar
-$progress.Location = New-Object System.Drawing.Point(20, 484)
+$progress.Location = New-Object System.Drawing.Point(20, 514)
 $progress.Size = New-Object System.Drawing.Size(585, 20)
 $form.Controls.Add($progress)
 
 $log = New-Object System.Windows.Forms.TextBox
-$log.Location = New-Object System.Drawing.Point(20, 512)
+$log.Location = New-Object System.Drawing.Point(20, 542)
 $log.Size = New-Object System.Drawing.Size(585, 150)
 $log.Multiline = $true
 $log.ScrollBars = "Vertical"
 $log.ReadOnly = $true
 $log.Font = New-Object System.Drawing.Font("Consolas", 9)
 $form.Controls.Add($log)
+
+# ---- Progress view (right-hand side): one row per deck, and everything being worked on now ----
+$lblDecks = New-Object System.Windows.Forms.Label
+$lblDecks.Text = "Decks"
+$lblDecks.Location = New-Object System.Drawing.Point(625, 14)
+$lblDecks.AutoSize = $true
+$lblDecks.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+$form.Controls.Add($lblDecks)
+
+function New-ProgressList([int]$y, [int]$h, $cols) {
+    $lv = New-Object System.Windows.Forms.ListView
+    $lv.Location = New-Object System.Drawing.Point(625, $y)
+    $lv.Size = New-Object System.Drawing.Size(520, $h)
+    $lv.View = [System.Windows.Forms.View]::Details
+    $lv.FullRowSelect = $true; $lv.MultiSelect = $false; $lv.HideSelection = $true
+    $lv.HeaderStyle = [System.Windows.Forms.ColumnHeaderStyle]::Nonclickable
+    $lv.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    foreach ($c in $cols) { [void]$lv.Columns.Add($c[0], $c[1]) }
+    # Draw progress bars in cells whose Tag is a percent (0-100); everything else is drawn normally
+    $lv.OwnerDraw = $true
+    try { $lv.GetType().GetProperty("DoubleBuffered", [Reflection.BindingFlags]"NonPublic,Instance").SetValue($lv, $true, $null) } catch {}
+    $lv.Add_DrawColumnHeader({ param($sender, $e) $e.DrawDefault = $true })
+    $lv.Add_DrawItem({ param($sender, $e) })
+    $lv.Add_DrawSubItem({
+        param($sender, $e)
+        $tag = $e.SubItem.Tag
+        if ($e.ColumnIndex -gt 0 -and $tag -is [int] -and $tag -ge 0) {
+            $g = $e.Graphics; $r = $e.Bounds
+            $g.FillRectangle([System.Drawing.SystemBrushes]::Window, $r)
+            $in = New-Object System.Drawing.Rectangle(($r.X + 3), ($r.Y + 3), ($r.Width - 6), ($r.Height - 6))
+            $g.FillRectangle($script:BarBack, $in)
+            $w = [int][Math]::Round($in.Width * [Math]::Min(100, $tag) / 100.0)
+            if ($w -gt 0) { $g.FillRectangle($(if ($tag -ge 100) { $script:BarDone } else { $script:BarFill }), $in.X, $in.Y, $w, $in.Height) }
+            $flags = [System.Windows.Forms.TextFormatFlags]::HorizontalCenter -bor [System.Windows.Forms.TextFormatFlags]::VerticalCenter -bor [System.Windows.Forms.TextFormatFlags]::SingleLine
+            [System.Windows.Forms.TextRenderer]::DrawText($g, $e.SubItem.Text, $sender.Font, $in, [System.Drawing.Color]::Black, $flags)
+        } else { $e.DrawDefault = $true }
+    })
+    $form.Controls.Add($lv)
+    return $lv
+}
+$script:BarBack = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(228, 232, 242))
+$script:BarFill = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(140, 175, 235))
+$script:BarDone = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(140, 205, 150))
+$lvDecks = New-ProgressList 34 200 @(@("Deck", 170), @("Audio", 120), @("Video", 110), @("Status", 115))
+
+$lblNow = New-Object System.Windows.Forms.Label
+$lblNow.Text = "Now working"
+$lblNow.Location = New-Object System.Drawing.Point(625, 246)
+$lblNow.AutoSize = $true
+$lblNow.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+$form.Controls.Add($lblNow)
+$lvNow = New-ProgressList 266 426 @(@("Working on", 185), @("Stage", 120), @("Progress", 120), @("Time", 90))
+
+$script:ViewClock = [Diagnostics.Stopwatch]::StartNew()
+function Format-Secs([double]$s) {
+    if ($s -lt 0) { return "" }
+    if ($s -lt 60) { return ("{0:0.0} s" -f $s) }
+    return ("{0}:{1:00}" -f [int][Math]::Floor($s / 60), [int]([Math]::Floor($s) % 60))
+}
+function Short-Name([string]$n) { if ($n.Length -gt 24) { return $n.Substring(0, 23) + "..." }; return $n }
+function Set-Cell($item, [int]$col, [string]$text, [int]$pct = -1) {
+    $sub = $item.SubItems[$col]
+    if ($sub.Text -ne $text) { $sub.Text = $text }
+    $sub.Tag = $pct
+}
+# Status text for one deck row
+function Get-DeckStatus($d, $c, $v) {
+    $r = $script:Run
+    if ($d.Status) { return $d.Status }
+    if ($r.Op -and $r.Op.Deck -eq $d) { return $r.Op.What }
+    if ($d.Built) {
+        if ($v -and -not $v.Done) { if ($v.Proc) { return $v.Stage } else { return "Video queued" } }
+        if ($v -and -not $v.Ok) { return "Video failed" }
+        if ($d.Note -and $d.Note -ne "OK") { return "Done (see log)" }
+        return "Done"
+    }
+    if ($d.PSObject.Properties["Ready"] -and -not $d.Ready) { return "Could not read" }
+    if ($c[1] -gt 0 -and $c[0] -lt $c[1]) { if ($c[2] -gt 0) { return "Voicing" } else { return "Waiting" } }
+    if (-not $d.PSObject.Properties["Ready"]) { return "Waiting" }
+    return "Audio ready"
+}
+# Refresh both lists (at most 4 times a second unless forced)
+function Update-ProgressView([switch]$Force) {
+    $r = $script:Run
+    if (-not $r -or -not $r.Decks) { return }
+    if (-not $Force -and $script:ViewClock.ElapsedMilliseconds -lt 250) { return }
+    $script:ViewClock.Restart()
+    $now = Get-Date
+    # Audio per deck: done, total, running
+    $cnt = @{}
+    foreach ($j in $r.Jobs) {
+        $k = $j.Deck.Path
+        if (-not $cnt.ContainsKey($k)) { $cnt[$k] = [int[]]@(0, 0, 0) }
+        $cnt[$k][1]++
+        if ($j.Done) { $cnt[$k][0]++ } elseif ($j.Proc) { $cnt[$k][2]++ }
+    }
+    $lvDecks.BeginUpdate()
+    foreach ($d in $r.Decks) {
+        if (-not $d.Row) { continue }
+        $c = $cnt[$d.Path]; if (-not $c) { $c = [int[]]@(0, 0, 0) }
+        if ($c[1] -gt 0) { Set-Cell $d.Row 1 "$($c[0]) / $($c[1])" ([int][Math]::Floor(100 * $c[0] / $c[1])) }
+        elseif ($d.PSObject.Properties["Ready"] -and $d.Ready) { Set-Cell $d.Row 1 "no notes" }
+        else { Set-Cell $d.Row 1 "" }
+        $v = $null; foreach ($x in $r.Videos) { if ($x.Deck -eq $d) { $v = $x } }
+        if (-not $r.Video) { Set-Cell $d.Row 2 "-" }
+        elseif ($v) {
+            if ($v.Done) { if ($v.Ok) { Set-Cell $d.Row 2 "Done" 100 } else { Set-Cell $d.Row 2 "Failed" } }
+            elseif ($v.Proc) { Set-Cell $d.Row 2 "$($v.Pct)%" $v.Pct }
+            else { Set-Cell $d.Row 2 "Queued" }
+        }
+        else { Set-Cell $d.Row 2 $d.PptVideo }
+        Set-Cell $d.Row 3 (Get-DeckStatus $d $c $v)
+    }
+    $lvDecks.EndUpdate()
+
+    # Everything running right now
+    $rows = New-Object System.Collections.ArrayList
+    $nVid = 0
+    foreach ($v in $r.Videos) {
+        if (-not $v.Proc -or $v.Done) { continue }
+        $nVid++
+        $t = if ($v.Eta -ge 0) { (Format-Secs $v.Eta) + " left" } else { Format-Secs ($now - $v.Started).TotalSeconds }
+        [void]$rows.Add(@(((Short-Name $v.Deck.Name) + "  -  video"), $v.Stage, "$($v.Pct)%", $t, $v.Pct))
+    }
+    if ($r.Op) {
+        $o = $r.Op; $pct = -1; $pt = ""
+        if ($o.Total -gt 0) { $pct = [int][Math]::Floor(100 * $o.N / $o.Total); $pt = "$($o.N) / $($o.Total)" }
+        if ($o.What -like "*PowerPoint*") { $nVid++ }
+        [void]$rows.Add(@((Short-Name $o.Deck.Name), $o.What, $pt, (Format-Secs ($now - $o.Start).TotalSeconds), $pct))
+    }
+    $rate = 0.0; if ($r.SpeakSecs -gt 0) { $rate = $r.SpeakChars / $r.SpeakSecs }
+    $nSl = 0
+    foreach ($j in $r.Jobs) {
+        if ($j.Done -or -not $j.Proc -or -not $j.PhaseStart) { continue }
+        $nSl++
+        $el = ($now - $j.PhaseStart).TotalSeconds; $pct = -1; $pt = ""
+        switch ($j.Phase) {
+            "speak"   { $st = "Speaking"
+                        if ($rate -gt 0) { $pct = [int][Math]::Min(99, [Math]::Floor(100 * $el * $rate / [Math]::Max(1, $j.Speech.Length))); $pt = "$pct%" } }
+            "measure" { $st = "Measuring volume" }
+            default   { $st = "Levelling + AAC" }
+        }
+        if ($j.Tries -gt 1) { $st += " (retry)" }
+        [void]$rows.Add(@(("{0}  -  slide {1}" -f (Short-Name $j.Deck.Name), $j.Index), $st, $pt, (Format-Secs $el), $pct))
+    }
+    $lvNow.BeginUpdate()
+    while ($lvNow.Items.Count -gt $rows.Count) { $lvNow.Items.RemoveAt($lvNow.Items.Count - 1) }
+    for ($i = 0; $i -lt $rows.Count; $i++) {
+        if ($i -ge $lvNow.Items.Count) {
+            $it = New-Object System.Windows.Forms.ListViewItem("")
+            for ($q = 0; $q -lt 3; $q++) { [void]$it.SubItems.Add("") }
+            [void]$lvNow.Items.Add($it)
+        }
+        $it = $lvNow.Items[$i]; $row = $rows[$i]
+        if ($it.Text -ne $row[0]) { $it.Text = $row[0] }
+        Set-Cell $it 1 $row[1]; Set-Cell $it 2 $row[2] $row[4]; Set-Cell $it 3 $row[3]
+    }
+    $lvNow.EndUpdate()
+    $lblNow.Text = "Now working:  $nSl slide$(if ($nSl -ne 1) { 's' }),  $nVid video$(if ($nVid -ne 1) { 's' })"
+    $lvDecks.Invalidate(); $lvNow.Invalidate()
+}
 
 $script:LogFile      = ""
 $script:LogToFile    = $false
@@ -910,7 +1368,7 @@ $saved = Load-Settings
 if ($saved) {
     if ($saved.Voice) { if ($voiceBox.Items.Contains($saved.Voice)) { $voiceBox.SelectedItem = $saved.Voice } else { $voiceBox.Text = $saved.Voice } }
     if ($null -ne $saved.Speed) { $speed.Value = [Math]::Max(-5, [Math]::Min(5, [int]$saved.Speed)) }
-    if ($saved.Video) { $rbVideo.Checked = $true }
+    if ($saved.Video) { $rbVideo.Checked = $true } else { $rbDeck.Checked = $true }
 
     if ($saved.Parallel) { $parallelBox.Value = [Math]::Max(1, [Math]::Min(32, [int]$saved.Parallel)) }
     if ($null -ne $saved.AutoSlides) { $autoSlides.Checked = [bool]$saved.AutoSlides }
@@ -918,6 +1376,7 @@ if ($saved) {
     if ($null -ne $saved.Method -and [int]$saved.Method -lt $methodBox.Items.Count) { $methodBox.SelectedIndex = [int]$saved.Method }
     if ($saved.VideoParallel) { $videoParBox.Value = [Math]::Max(1, [Math]::Min(12, [int]$saved.VideoParallel)) }
     if ($null -ne $saved.Chapters -and [int]$saved.Chapters -lt $chapterBox.Items.Count) { $chapterBox.SelectedIndex = [int]$saved.Chapters }
+    # Captions always start ticked (not restored from last time)
     Update-VideoChoices $saved.Resolution $saved.FrameRate
 }
 if (-not $voiceBox.Text -and $voiceBox.Items.Count -gt 0) {
@@ -994,7 +1453,7 @@ $fileList.Add_KeyDown({ param($s, $e) if ($e.KeyCode -eq "Delete") { $removeBtn.
 $drop.Add_Click({ $browse.PerformClick() })
 
 $speed.Add_ValueChanged({ $lblSpeed.Text = "Speed: $($speed.Value)" })
-$rbVideo.Add_CheckedChanged({ $resBox.Enabled = $rbVideo.Checked; $fpsBox.Enabled = $rbVideo.Checked; $methodBox.Enabled = $rbVideo.Checked; $videoParBox.Enabled = $rbVideo.Checked -and -not $autoVideos.Checked; $autoVideos.Enabled = $rbVideo.Checked; $chapterBox.Enabled = $rbVideo.Checked })
+$rbVideo.Add_CheckedChanged({ $resBox.Enabled = $rbVideo.Checked; $fpsBox.Enabled = $rbVideo.Checked; $methodBox.Enabled = $rbVideo.Checked; $videoParBox.Enabled = $rbVideo.Checked -and -not $autoVideos.Checked; $autoVideos.Enabled = $rbVideo.Checked; $chapterBox.Enabled = $rbVideo.Checked; $captionBox.Enabled = $rbVideo.Checked })
 # Show the Auto numbers straight away, and keep them up to date as settings change
 function Update-AutoValues {
     if ($autoSlides.Checked) {
@@ -1015,14 +1474,14 @@ $voiceBox.Add_TextChanged({ Update-AutoValues })
 $methodBox.Add_SelectedIndexChanged({ Update-AutoValues })
 $fpsBox.Add_SelectedIndexChanged({ Update-AutoValues })
 Update-AutoValues
-$resBox.Enabled = $rbVideo.Checked; $fpsBox.Enabled = $rbVideo.Checked; $methodBox.Enabled = $rbVideo.Checked; $videoParBox.Enabled = $rbVideo.Checked -and -not $autoVideos.Checked; $autoVideos.Enabled = $rbVideo.Checked; $chapterBox.Enabled = $rbVideo.Checked; $parallelBox.Enabled = -not $autoSlides.Checked
+$resBox.Enabled = $rbVideo.Checked; $fpsBox.Enabled = $rbVideo.Checked; $methodBox.Enabled = $rbVideo.Checked; $videoParBox.Enabled = $rbVideo.Checked -and -not $autoVideos.Checked; $autoVideos.Enabled = $rbVideo.Checked; $chapterBox.Enabled = $rbVideo.Checked; $captionBox.Enabled = $rbVideo.Checked; $parallelBox.Enabled = -not $autoSlides.Checked
 
 $preview.Add_Click({
     if (-not $voiceBox.Text.Trim()) { return }
     $preview.Enabled = $false
     Log "Previewing $($voiceBox.Text.Trim())..."
     $pv = Join-Path $env:TEMP "slide-narrator-preview.wav"
-    if (Invoke-Speech "Welcome everyone. This unit is about W H S communication and consultation." $pv $voiceBox.Text.Trim() $speed.Value) {
+    if (Invoke-Speech "Welcome everyone. This is how your narrated slides will sound." $pv $voiceBox.Text.Trim() $speed.Value) {
         try { (New-Object System.Media.SoundPlayer $pv).PlaySync() } catch { Log "Could not play preview: $($_.Exception.Message)" }
     } else {
         Log "Preview failed: $($script:LastSpeechError)"
@@ -1089,9 +1548,9 @@ function Get-DeckNotes($ppt, [string]$pptx) {
                 if ($shp.Type -eq 14 -and $shp.PlaceholderFormat.Type -eq 2 -and $shp.HasTextFrame) { $notes = $shp.TextFrame.TextRange.Text }
             }
             $notes = ($notes -replace "`r", "`r`n").Trim()
-            $speech = ""
-            if ($notes) { $speech = Fix-Pronunciation (Clean-Text $notes) }
-            $list += [pscustomobject]@{ Index = $slide.SlideIndex; Speech = $speech }
+            $speech = ""; $caption = ""
+            if ($notes) { $speech = Clean-Text $notes; $caption = Clean-Caption $notes }
+            $list += [pscustomobject]@{ Index = $slide.SlideIndex; Speech = $speech; Caption = $caption }
         }
         return ,$list
     } finally { try { $pres.Close() } catch {} }
@@ -1104,6 +1563,7 @@ function Start-AudioJob($job) {
     [IO.File]::WriteAllText($job.Txt, $job.Speech, (New-Object System.Text.UTF8Encoding($true)))
     if (Test-Path $job.Wav) { Remove-Item $job.Wav -Force -ErrorAction SilentlyContinue }
     if (Test-Path $job.M4a) { Remove-Item $job.M4a -Force -ErrorAction SilentlyContinue }
+    foreach ($f in @($job.NormWav, $job.Loud)) { if (Test-Path $f) { Remove-Item $f -Force -ErrorAction SilentlyContinue } }
     $job.Phase = "speak"
     $voice = $script:Run.Voice; $rate = $script:Run.Rate
     switch ($script:Engine) {
@@ -1115,7 +1575,40 @@ function Start-AudioJob($job) {
                    $argLine = "-NoProfile -ExecutionPolicy Bypass -File " + (Quote $script:Sapi32Helper) + " " + (Quote $job.Txt) + " " + (Quote $job.Wav) + " " + (Quote $voice) + " $rate" }
     }
     $job.Tries++
+    $job.PhaseStart = Get-Date
     $job.Proc = Start-Process -FilePath $exe -ArgumentList $argLine -WindowStyle Hidden -PassThru
+}
+
+# ---- Even volume: every slide is measured and set to the same loudness ----
+$script:LoudTarget = -19          # LUFS (the usual level for mono speech)
+$script:LoudMeasure = "loudnorm=I=-19:TP=-1.5:LRA=11:print_format=json"
+# Gain in dB from ffmpeg's loudness report (0 if it can't be read)
+function Get-LoudGain([string]$report) {
+    try {
+        $m = [regex]::Match($report, '\{[^{}]*"input_i"[^{}]*\}')
+        if (-not $m.Success) { return 0.0 }
+        $i = [double]::Parse(($m.Value | ConvertFrom-Json).input_i, [Globalization.CultureInfo]::InvariantCulture)
+        if ($i -lt -70) { return 0.0 }
+        return [Math]::Max(-20.0, [Math]::Min(20.0, $script:LoudTarget - $i))
+    } catch { return 0.0 }
+}
+# Gain, then a limiter so the loudest peaks stay just under -1.5 dB
+function Get-LevelFilter([double]$gain) { return "volume=" + $gain.ToString("0.00", [Globalization.CultureInfo]::InvariantCulture) + "dB,alimiter=limit=0.8414:level=0" }
+# One ffmpeg run: the levelled WAV (for the video) and the AAC copy (for the PowerPoint)
+function Get-LevelArgs([string]$wav, [string]$norm, [string]$m4a, [double]$gain) {
+    $af = Get-LevelFilter $gain
+    return "-y -loglevel error -i " + (Quote $wav) + " -af $af -c:a pcm_s16le " + (Quote $norm) + " -af $af -c:a aac -b:a 64k -ac 1 " + (Quote $m4a)
+}
+# Same thing, done straight away (used when a slide's audio had to be remade)
+function Set-SlideLevel([string]$wav, [string]$m4a) {
+    $norm = [IO.Path]::ChangeExtension($wav, ".level.wav")
+    $report = (& $script:Ffmpeg -hide_banner -nostats -i $wav -af $script:LoudMeasure -f null - 2>&1 | Out-String)
+    $af = Get-LevelFilter (Get-LoudGain $report)
+    & $script:Ffmpeg -y -loglevel error -i $wav -af $af -c:a pcm_s16le $norm -af $af -c:a aac -b:a 64k -ac 1 $m4a 2>$null | Out-Null
+    if ((Test-Path $norm) -and (Get-Item $norm).Length -gt 1000) { Move-Item -LiteralPath $norm -Destination $wav -Force }
+    if (-not ((Test-Path $m4a) -and (Get-Item $m4a).Length -gt 500)) {
+        & $script:Ffmpeg -y -loglevel error -i $wav -c:a aac -b:a 64k -ac 1 $m4a 2>$null | Out-Null
+    }
 }
 
 # Check running jobs, start new ones, update progress. Call this often.
@@ -1143,7 +1636,8 @@ function Pump-Video {
         } else {
             $running++
             $p = Read-Shared $v.Progress
-            if ($p) { $status += "$($v.Deck.Name) $p" }
+            if ($p -match '^(.*?)\|(\d+)\|(-?\d+)$') { $v.Stage = $matches[1]; $v.Pct = [int]$matches[2]; $v.Eta = [int]$matches[3] }
+            $status += "$($v.Deck.Name) $($v.Pct)%"
         }
     }
     foreach ($v in $r.Videos) {
@@ -1151,14 +1645,13 @@ function Pump-Video {
         if (-not $v.Done -and -not $v.Proc) {
             $exe = Join-Path $PSHOME "powershell.exe"
             $v.Proc = Start-Process -FilePath $exe -ArgumentList ("-NoProfile -ExecutionPolicy Bypass -File " + (Quote $script:VideoWorker) + " " + (Quote $v.JobFile)) -WindowStyle Hidden -PassThru
+            $v.Started = Get-Date; $v.Stage = "Starting"
             Log-To $v.Deck.Log "Building video with ffmpeg: $($v.Deck.Name)"
             $running++; $queued--
         }
     }
     if ($r.Videos.Count -gt 0) {
-        $txt = "Video: $running building, $queued waiting, $done done"
-        if ($status.Count -gt 0) { $txt += "  (" + ($status[0] -replace '^(.{0,25}).*?(\d+/\d+)$', '$1... $2') + ")" }
-        $lblVideo.Text = $txt
+        $lblVideo.Text = "Video: $running building, $queued waiting, $done done"
     }
 }
 
@@ -1175,15 +1668,28 @@ function Pump-Audio {
         if ($j.Done -or -not $j.Proc) { continue }
         if ($j.Proc.HasExited) {
             if ($j.Phase -eq "convert") {
-                # AAC conversion finished (if it failed, the WAV is used instead)
+                # Levelled WAV + AAC done. If levelling failed, the original WAV is used as it is.
+                if ((Test-Path $j.NormWav) -and (Get-Item $j.NormWav).Length -gt 1000) {
+                    try { Move-Item -LiteralPath $j.NormWav -Destination $j.Wav -Force } catch {}
+                }
                 $j.Done = $true; $j.Ok = $true; $r.DoneCount++; continue
             }
+            if ($j.Phase -eq "measure") {
+                # Loudness measured: set the level and make the AAC copy for the PowerPoint
+                $gain = Get-LoudGain (Read-Shared $j.Loud)
+                $j.Phase = "convert"; $j.PhaseStart = Get-Date
+                $j.Proc = Start-Process -FilePath $script:Ffmpeg -ArgumentList (Get-LevelArgs $j.Wav $j.NormWav $j.M4a $gain) -WindowStyle Hidden -PassThru
+                $running++; continue
+            }
             $ok = (Test-Path $j.Wav) -and ((Get-Item $j.Wav).Length -gt 1000)
+            if ($ok -and $j.PhaseStart) {   # speaking speed, used to estimate progress of the others
+                $r.SpeakChars += $j.Speech.Length; $r.SpeakSecs += ((Get-Date) - $j.PhaseStart).TotalSeconds
+            }
             if ($ok -and $script:Ffmpeg) {
-                # Speech done: compress it to AAC (.m4a) in the background for the PowerPoint
-                $j.Phase = "convert"
-                $argLine = "-y -loglevel error -i " + (Quote $j.Wav) + " -c:a aac -b:a 64k -ac 1 " + (Quote $j.M4a)
-                $j.Proc = Start-Process -FilePath $script:Ffmpeg -ArgumentList $argLine -WindowStyle Hidden -PassThru
+                # Speech done: measure its loudness in the background (report saved to a text file)
+                $j.Phase = "measure"; $j.PhaseStart = Get-Date
+                $argLine = '/d /c "' + (Quote $script:Ffmpeg) + ' -hide_banner -nostats -i ' + (Quote $j.Wav) + ' -af ' + $script:LoudMeasure + ' -f null - 2>' + (Quote $j.Loud) + '"'
+                $j.Proc = Start-Process -FilePath $env:ComSpec -ArgumentList $argLine -WindowStyle Hidden -PassThru
                 $running++
             }
             elseif ($ok) { $j.Done = $true; $j.Ok = $true; $r.DoneCount++ }
@@ -1198,6 +1704,7 @@ function Pump-Audio {
     }
     if ($r.Jobs.Count -gt 0) { $progress.Maximum = $r.Jobs.Count; $progress.Value = [Math]::Min($r.Jobs.Count, $r.DoneCount) }
     $lblAudio.Text = "Audio: $($r.DoneCount) of $($r.Jobs.Count) slides"
+    Update-ProgressView
     [System.Windows.Forms.Application]::DoEvents()
 }
 
@@ -1231,29 +1738,22 @@ function Get-ChapterMap($pres, [int]$mode) {
     return $map
 }
 
-# Add chapters to an existing MP4 (used after a PowerPoint export)
-function Add-ChaptersToMp4([string]$mp4, $segments, [string]$workDir) {
-    $chapters = @(); $clock = 0.0
-    foreach ($sg in $segments) {
-        if ($sg.Chapter) { $chapters += [pscustomobject]@{ Title = [string]$sg.Chapter; Start = $clock } }
-        $clock += [double]$sg.Dur
+# Add chapters, a chapter list and captions to a video PowerPoint has exported (uses the video worker)
+function Add-VideoExtras($deck, $segments) {
+    $r = $script:Run
+    $vjob = [pscustomobject]@{
+        Ffmpeg = $script:Ffmpeg; Fps = 0; Codec = ""; WorkDir = $deck.WorkDir; Log = $deck.Log; Progress = ""
+        Out = $deck.OutMp4; Segments = $segments; Captions = $r.Captions; Mode = "extras"; Threads = [Math]::Max(2, $script:LogicalCores)
     }
-    if ($chapters.Count -eq 0) { return }
-    $ml = @(";FFMETADATA1")
-    for ($c = 0; $c -lt $chapters.Count; $c++) {
-        $st = [long][Math]::Round($chapters[$c].Start * 1000)
-        $en = if ($c + 1 -lt $chapters.Count) { [long][Math]::Round($chapters[$c + 1].Start * 1000) } else { [long][Math]::Round($clock * 1000) }
-        $tt = $chapters[$c].Title -replace '([\\=;#])', '\$1'
-        $ml += @("[CHAPTER]", "TIMEBASE=1/1000", "START=$st", "END=$en", "title=$tt")
-    }
-    $meta = Join-Path $workDir "chapters.txt"
-    [IO.File]::WriteAllLines($meta, $ml, (New-Object System.Text.UTF8Encoding($false)))
-    $tmp = [IO.Path]::ChangeExtension($mp4, ".chapters.mp4")
-    & $script:Ffmpeg -y -loglevel error -i $mp4 -i $meta -map 0 -map_metadata 1 -map_chapters 1 -c copy -movflags +faststart $tmp 2>$null | Out-Null
-    if ((Test-Path $tmp) -and (Get-Item $tmp).Length -gt 1000) {
-        Remove-Item $mp4 -Force; Rename-Item $tmp ([IO.Path]::GetFileName($mp4))
-        Log "Added $($chapters.Count) chapters to the video."
-    } else { Log "Could not add chapters to the video (the video itself is fine)." }
+    $jf = Join-Path $deck.WorkDir "video-extras.json"
+    [IO.File]::WriteAllText($jf, ($vjob | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
+    $lblVideo.Text = "Video: adding chapters and captions to $($deck.Name)"
+    $r.Op = [pscustomobject]@{ Deck = $deck; What = "Adding captions/chapters"; N = 0; Total = 0; Start = (Get-Date) }
+    $p = Start-Process -FilePath (Join-Path $PSHOME "powershell.exe") -ArgumentList ("-NoProfile -ExecutionPolicy Bypass -File " + (Quote $script:VideoWorker) + " " + (Quote $jf)) -WindowStyle Hidden -PassThru
+    while (-not $p.HasExited) { Pump-Audio; Start-Sleep -Milliseconds 200 }
+    $r.Op = $null
+    if ($p.ExitCode -ne 0) { Log "Could not add chapters or captions to the video (the video itself is fine). See the log for details." }
+    $lblVideo.Text = "Video: -"
 }
 
 # Insert audio into one deck, save it, export the video
@@ -1265,10 +1765,12 @@ function Build-Deck($ppt, $deck) {
     $pres = $ppt.Presentations.Open($deck.Path, $msoTrue, $msoFalse, $msoTrue)
     $failed = @(); $videoOk = $true; $segments = @()
     $chap = Get-ChapterMap $pres $r.Chapters
+    $r.Op = [pscustomobject]@{ Deck = $deck; What = "Inserting audio"; N = 0; Total = $pres.Slides.Count; Start = (Get-Date) }
     try {
         foreach ($slide in $pres.Slides) {
             Pump-Audio
             $i = $slide.SlideIndex
+            $r.Op.N = $i
             for ($s = $slide.Shapes.Count; $s -ge 1; $s--) {
                 if ($slide.Shapes.Item($s).Name -eq "Narration") { $slide.Shapes.Item($s).Delete() }
             }
@@ -1276,7 +1778,7 @@ function Build-Deck($ppt, $deck) {
             $t.AdvanceOnClick = $msoFalse; $t.AdvanceOnTime = $msoTrue
             $job = $r.Jobs | Where-Object { $_.Deck -eq $deck -and $_.Index -eq $i } | Select-Object -First 1
             $img = Join-Path $deck.WorkDir ("slide_{0:D2}.png" -f $i)
-            if (-not $job) { $t.AdvanceTime = $r.NoNotes; $segments += [pscustomobject]@{ Index = $i; Img = $img; Wav = ""; Dur = [double]$r.NoNotes; Chapter = [string]$chap[[int]$i] }; continue }
+            if (-not $job) { $t.AdvanceTime = $r.NoNotes; $segments += [pscustomobject]@{ Index = $i; Img = $img; Wav = ""; WavDur = 0.0; Dur = [double]$r.NoNotes; Chapter = [string]$chap[[int]$i]; Caption = "" }; continue }
 
             if (-not $job.Ok) {
                 Log "   slide ${i}: retrying audio..."
@@ -1285,16 +1787,14 @@ function Build-Deck($ppt, $deck) {
             if (-not $job.Ok) {
                 $secs = [Math]::Max(5, [int](($job.Speech -split '\s+').Count / 2.5))
                 $t.AdvanceTime = $secs; $failed += $i
-                $segments += [pscustomobject]@{ Index = $i; Img = $img; Wav = ""; Dur = [double]$secs; Chapter = [string]$chap[[int]$i] }
+                $segments += [pscustomobject]@{ Index = $i; Img = $img; Wav = ""; WavDur = 0.0; Dur = [double]$secs; Chapter = [string]$chap[[int]$i]; Caption = "" }
                 Log ("   FAILED. Slide {0} has no audio and will show for {1} s. Reason: {2}" -f $i, $secs, $script:LastSpeechError)
                 continue
             }
-            # Use the AAC file made in the background; make it now only if it's missing
+            # Use the levelled AAC file made in the background; make it now only if it's missing
             $audio = $job.Wav
             if ($script:Ffmpeg) {
-                if (-not ((Test-Path $job.M4a) -and (Get-Item $job.M4a).Length -gt 500)) {
-                    & $script:Ffmpeg -y -loglevel error -i $job.Wav -c:a aac -b:a 64k -ac 1 $job.M4a 2>$null | Out-Null
-                }
+                if (-not ((Test-Path $job.M4a) -and (Get-Item $job.M4a).Length -gt 500)) { Set-SlideLevel $job.Wav $job.M4a }
                 if ((Test-Path $job.M4a) -and (Get-Item $job.M4a).Length -gt 500) { $audio = $job.M4a }
             }
             $media = $slide.Shapes.AddMediaObject2($audio, $msoFalse, $msoTrue, 10, 10, 40, 40)
@@ -1302,8 +1802,11 @@ function Build-Deck($ppt, $deck) {
             $play = $media.AnimationSettings.PlaySettings
             $play.PlayOnEntry = $msoTrue; $play.HideWhileNotPlaying = $msoTrue
             $t.AdvanceTime = $r.Pause
-            $segments += [pscustomobject]@{ Index = $i; Img = $img; Wav = $job.Wav; Dur = [Math]::Round((Get-WavSeconds $job.Wav) + $r.Pause, 3); Chapter = [string]$chap[[int]$i] }
+            $wavSecs = Get-WavSeconds $job.Wav
+            $segments += [pscustomobject]@{ Index = $i; Img = $img; Wav = $job.Wav; WavDur = [Math]::Round($wavSecs, 3); Dur = [Math]::Round($wavSecs + $r.Pause, 3); Chapter = [string]$chap[[int]$i]; Caption = [string]$job.Caption }
         }
+        $r.Op = [pscustomobject]@{ Deck = $deck; What = "Saving PowerPoint"; N = 0; Total = 0; Start = (Get-Date) }
+        Pump-Audio
         $pres.SaveAs($deck.OutPptx)
         Log "Saved: $($deck.OutPptx)"
 
@@ -1312,25 +1815,30 @@ function Build-Deck($ppt, $deck) {
             $h = [int]$r.VRes
             $w = [int]([Math]::Round($h * $pres.PageSetup.SlideWidth / $pres.PageSetup.SlideHeight / 2) * 2)
             Log "Exporting slide pictures ($w x $h)..."
+            $r.Op = [pscustomobject]@{ Deck = $deck; What = "Exporting pictures"; N = 0; Total = $pres.Slides.Count; Start = (Get-Date) }
             foreach ($slide in $pres.Slides) {
+                $r.Op.N = $slide.SlideIndex
                 Pump-Audio
                 $slide.Export((Join-Path $deck.WorkDir ("slide_{0:D2}.png" -f $slide.SlideIndex)), "PNG", $w, $h)
             }
             $vjob = [pscustomobject]@{
                 Ffmpeg = $script:Ffmpeg; Fps = $r.Fps; Codec = $r.Codec; WorkDir = $deck.WorkDir; Log = $deck.Log
                 Progress = (Join-Path $deck.WorkDir "video-progress.txt"); Out = $deck.OutMp4; Segments = $segments
+                Captions = $r.Captions; Mode = "build"
                 Threads = [Math]::Max(2, [int][Math]::Floor($script:LogicalCores / [Math]::Max(1, $r.VideoParallel)))
             }
             $jf = Join-Path $deck.WorkDir "video-job.json"
             [IO.File]::WriteAllText($jf, ($vjob | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
             if (Test-Path $vjob.Progress) { Remove-Item $vjob.Progress -Force }
             if (Test-Path $deck.OutMp4) { Remove-Item $deck.OutMp4 -Force -ErrorAction SilentlyContinue }
-            $script:Run.Videos += [pscustomobject]@{ Deck = $deck; JobFile = $jf; Progress = $vjob.Progress; Out = $deck.OutMp4; Proc = $null; Done = $false; Ok = $false }
+            $script:Run.Videos += [pscustomobject]@{ Deck = $deck; JobFile = $jf; Progress = $vjob.Progress; Out = $deck.OutMp4; Proc = $null; Done = $false; Ok = $false; Stage = "Queued"; Pct = 0; Eta = -1; Started = $null }
             Log "Video queued ($($r.CodecName)). It will be built in the background."
             $deck.VideoNote = "video queued"
         }
         elseif ($r.Video) {
             Log "Exporting video ($($r.VRes)p, $($r.Fps) fps)... audio for the next decks keeps going meanwhile."
+            $r.Op = [pscustomobject]@{ Deck = $deck; What = "PowerPoint video export"; N = 0; Total = 0; Start = (Get-Date) }
+            $deck.PptVideo = "Exporting"
             $pres.CreateVideo($deck.OutMp4, $true, $r.NoNotes, $r.VRes, $r.Fps, 85)
             $lblVideo.Text = "Video: exporting $($deck.Name)"
             do {
@@ -1338,10 +1846,12 @@ function Build-Deck($ppt, $deck) {
                 $status = $pres.CreateVideoStatus      # 1 in progress, 2 queued, 3 done, 4 failed
             } while ($status -eq 1 -or $status -eq 2)
             $lblVideo.Text = "Video: -"
-            if ($status -eq 3) { Log "Saved video: $($deck.OutMp4)"; if ($script:Ffmpeg -and $r.Chapters -ne 2) { Add-ChaptersToMp4 $deck.OutMp4 $segments $deck.WorkDir } }
+            $deck.PptVideo = $(if ($status -eq 3) { "Done" } else { "Failed" })
+            if ($status -eq 3) { Log "Saved video: $($deck.OutMp4)"; if ($script:Ffmpeg -and ($r.Chapters -ne 2 -or $r.Captions)) { Add-VideoExtras $deck $segments } }
             else { $videoOk = $false; Log "Video export failed (status $status). Try 1080p, or open the narrated deck and use File > Export > Create a Video." }
         }
     } finally {
+        $r.Op = $null
         try { $pres.Close() } catch {}
         $script:LogToFile = $false
     }
@@ -1356,7 +1866,7 @@ $start.Add_Click({
     if ($fileList.Items.Count -eq 0) { [System.Windows.Forms.MessageBox]::Show("Drag one or more PowerPoint files onto the window first.", "Slide Narrator") | Out-Null; return }
     if (-not $voiceBox.Text.Trim()) { [System.Windows.Forms.MessageBox]::Show("Choose or type a voice first.", "Slide Narrator") | Out-Null; return }
 
-    $settings = [pscustomobject]@{ Voice = "$($voiceBox.Text.Trim())"; Speed = $speed.Value; Video = $rbVideo.Checked; Resolution = "$($resBox.SelectedItem)"; FrameRate = "$($fpsBox.SelectedItem)"; Parallel = [int]$parallelBox.Value; Method = $methodBox.SelectedIndex; VideoParallel = [int]$videoParBox.Value; Chapters = $chapterBox.SelectedIndex; AutoSlides = $autoSlides.Checked; AutoVideos = $autoVideos.Checked }
+    $settings = [pscustomobject]@{ Voice = "$($voiceBox.Text.Trim())"; Speed = $speed.Value; Video = $rbVideo.Checked; Resolution = "$($resBox.SelectedItem)"; FrameRate = "$($fpsBox.SelectedItem)"; Parallel = [int]$parallelBox.Value; Method = $methodBox.SelectedIndex; VideoParallel = [int]$videoParBox.Value; Chapters = $chapterBox.SelectedIndex; Captions = $captionBox.Checked; AutoSlides = $autoSlides.Checked; AutoVideos = $autoVideos.Checked }
     $vres = Choice-Value $script:ResChoices "$($resBox.SelectedItem)"; if (-not $vres) { $vres = 1080 }
     $fps  = Choice-Value $script:FpsChoices "$($fpsBox.SelectedItem)"; if ($null -eq $fps) { $fps = 15 }
     $fast = $settings.Video -and ($methodBox.SelectedIndex -lt 2)
@@ -1385,6 +1895,8 @@ $start.Add_Click({
         Parallel = $slidesAtOnce; Pause = 1; NoNotes = 4; Jobs = @(); DoneCount = 0
         Fast = $fast; Codec = $(if ($methodBox.SelectedIndex -eq 1) { "h265" } else { "h264" }); CodecName = $methodBox.Text
         Videos = @(); VideoParallel = $videosAtOnce; Chapters = $settings.Chapters
+        Captions = [bool]($settings.Captions -and $settings.Video -and $script:Ffmpeg)
+        Decks = @(); Op = $null; SpeakChars = 0.0; SpeakSecs = 0.0
     }
     $decks = @()
     foreach ($p in @($fileList.Items)) {
@@ -1393,9 +1905,17 @@ $start.Add_Click({
             Path = $path; Name = $name; Log = (Join-Path $dir ($name + "_narration.log"))
             WorkDir = (Join-Path $dir ($name + "_narration"))
             OutPptx = (Join-Path $dir ($name + "_narrated.pptx")); OutMp4 = (Join-Path $dir ($name + ".mp4"))
-            VideoNote = ""
+            VideoNote = ""; Row = $null; Built = $false; Status = ""; PptVideo = ""
         }
     }
+    $script:Run.Decks = $decks
+    $lvDecks.Items.Clear(); $lvNow.Items.Clear()
+    foreach ($d in $decks) {
+        $it = New-Object System.Windows.Forms.ListViewItem((Short-Name $d.Name))
+        for ($q = 0; $q -lt 3; $q++) { [void]$it.SubItems.Add("") }
+        [void]$lvDecks.Items.Add($it); $d.Row = $it
+    }
+    Update-ProgressView -Force
     $results = @()
     $ppt = $null
     try {
@@ -1423,9 +1943,10 @@ $start.Add_Click({
                     if (-not $n.Speech) { continue }
                     $tag = "slide_{0:D2}" -f $n.Index
                     $script:Run.Jobs += [pscustomobject]@{
-                        Deck = $d; Index = $n.Index; Speech = $n.Speech
+                        Deck = $d; Index = $n.Index; Speech = $n.Speech; Caption = $n.Caption
                         Txt = (Join-Path $d.WorkDir "$tag.txt"); Wav = (Join-Path $d.WorkDir "$tag.wav"); M4a = (Join-Path $d.WorkDir "$tag.m4a"); Phase = "speak"
-                        Proc = $null; Tries = 0; Done = $false; Ok = $false
+                        NormWav = (Join-Path $d.WorkDir "$tag.level.wav"); Loud = (Join-Path $d.WorkDir "$tag.loudness.txt")
+                        Proc = $null; Tries = 0; Done = $false; Ok = $false; PhaseStart = $null
                     }
                 }
                 Log-To $d.Log ("   {0} slides, {1} with notes" -f $notes.Count, @($notes | Where-Object { $_.Speech }).Count)
@@ -1446,10 +1967,12 @@ $start.Add_Click({
                 Wait-DeckAudio $d
                 $note = Build-Deck $ppt $d
                 $d | Add-Member -NotePropertyName Note -NotePropertyValue $note -Force
+                $d.Built = $true
                 $results += $d
             } catch {
                 $msg = $_.Exception.Message
                 if ($msg -eq "Cancelled.") { throw }
+                $d.Status = "Failed"
                 Log-To $d.Log "STOPPED: $msg"
                 Log-To $d.Log ("Details: " + ($_ | Out-String).Trim())
                 Log-To $d.Log ("Where: " + $_.ScriptStackTrace)
@@ -1464,7 +1987,11 @@ $start.Add_Click({
         }
     } catch {
         $msg = $_.Exception.Message
-        if ($msg -eq "Cancelled.") { $results += "CANCELLED (remaining decks were not finished)" }
+        if ($msg -eq "Cancelled.") {
+            $results += "CANCELLED (remaining decks were not finished)"
+            foreach ($d in $decks) { if (-not $d.Built -and -not $d.Status) { $d.Status = "Cancelled" } }
+            foreach ($v in $script:Run.Videos) { if (-not $v.Done) { $v.Done = $true; $v.Ok = $false } }
+        }
         else {
             $results += "STOPPED: $msg"
             foreach ($d in $decks) { Log-To $d.Log "STOPPED: $msg"; Log-To $d.Log ("Where: " + $_.ScriptStackTrace) }
@@ -1475,11 +2002,15 @@ $start.Add_Click({
         if ($ppt) { try { $ppt.Quit() } catch {}; try { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($ppt) } catch {} }
         $script:LogToFile = $false
         foreach ($c in $controls) { $c.Enabled = $true }
-        $resBox.Enabled = $rbVideo.Checked; $fpsBox.Enabled = $rbVideo.Checked; $methodBox.Enabled = $rbVideo.Checked; $videoParBox.Enabled = $rbVideo.Checked -and -not $autoVideos.Checked; $autoVideos.Enabled = $rbVideo.Checked; $chapterBox.Enabled = $rbVideo.Checked; $parallelBox.Enabled = -not $autoSlides.Checked
+        $resBox.Enabled = $rbVideo.Checked; $fpsBox.Enabled = $rbVideo.Checked; $methodBox.Enabled = $rbVideo.Checked; $videoParBox.Enabled = $rbVideo.Checked -and -not $autoVideos.Checked; $autoVideos.Enabled = $rbVideo.Checked; $chapterBox.Enabled = $rbVideo.Checked; $captionBox.Enabled = $rbVideo.Checked; $parallelBox.Enabled = -not $autoSlides.Checked
         $cancel.Enabled = $false
         $form.AllowDrop = $true; $drop.AllowDrop = $true
         $form.Text = "Slide Narrator"
         $lblVideo.Text = "Video: -"
+        $script:Run.Op = $null
+        foreach ($j in $script:Run.Jobs) { $j.Proc = $null }
+        foreach ($v in $script:Run.Videos) { if (-not $v.Done) { $v.Done = $true } }
+        try { Update-ProgressView -Force } catch {}
     }
     $lines = foreach ($x in $results) {
         if ($x -is [string]) { $x }
