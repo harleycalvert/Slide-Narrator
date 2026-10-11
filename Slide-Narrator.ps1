@@ -320,7 +320,7 @@ param([string]$JobFile)
 # with chapters, a YouTube chapter list and captions. Mode "extras" adds chapters and
 # captions to an MP4 that PowerPoint has already exported.
 $ErrorActionPreference = "Continue"   # native tools write to stderr; we check exit codes instead
-$job = Get-Content -LiteralPath $JobFile -Raw | ConvertFrom-Json
+$job = Get-Content -LiteralPath $JobFile -Raw -Encoding UTF8 | ConvertFrom-Json   # UTF8: keeps curly apostrophes etc. intact
 $log = $job.Log
 $inv = [Globalization.CultureInfo]::InvariantCulture
 $utf8 = New-Object System.Text.UTF8Encoding($false)
@@ -556,8 +556,10 @@ function Write-Captions($segs, $startsArr, $lensArr) {
             $srt += @("$n", ((Format-CueTime $c.Start ",") + " --> " + (Format-CueTime $c.End ",")), $c.Text, "")
             $vtt += @(((Format-CueTime $c.Start ".") + " --> " + (Format-CueTime $c.End ".")), $c.Text, "")
         }
-        [IO.File]::WriteAllText("$base.srt", (($srt -join "`r`n") -replace "(?<!`r)`n", "`r`n"), $utf8)
-        [IO.File]::WriteAllText("$base.vtt", ($vtt -join "`n"), $utf8)
+        # Saved with a UTF-8 marker (BOM) so players such as VLC read curly apostrophes and dashes correctly
+        $bom = New-Object System.Text.UTF8Encoding($true)
+        [IO.File]::WriteAllText("$base.srt", (($srt -join "`r`n") -replace "(?<!`r)`n", "`r`n"), $bom)
+        [IO.File]::WriteAllText("$base.vtt", ($vtt -join "`n"), $bom)
         W "Captions: $($cues.Count) captions saved as $([IO.Path]::GetFileName($base)).srt and .vtt"
         return "$base.srt"
     } catch { W ("Captions skipped: " + $_.Exception.Message); return "" }
@@ -823,7 +825,7 @@ function New-SlideAudio([string]$text, [string]$wav, [string]$voice, [int]$rate)
 }
 
 function Load-Settings {
-    try { if (Test-Path $SettingsFile) { return Get-Content $SettingsFile -Raw | ConvertFrom-Json } } catch {}
+    try { if (Test-Path $SettingsFile) { return Get-Content $SettingsFile -Raw -Encoding UTF8 | ConvertFrom-Json } } catch {}
     return $null
 }
 function Save-Settings($obj) {
