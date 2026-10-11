@@ -2,6 +2,8 @@
 
 Turn PowerPoint speaker notes into natural-voice narration and export as video. Windows, drag and drop, batch-friendly.
 
+Just double-click the Slide-Narrator.bat and it will launch the app.
+
 Slide Narrator reads the speaker notes on every slide, voices them with a natural-sounding text-to-speech voice, inserts the audio into each slide (set to play and advance automatically), and can export the result as an MP4. Your original PowerPoint is never changed.
 
 It's built for speed: one slide is voiced per CPU thread, and several videos can be built in parallel. The videos are up to 4K resolution with tiny file sizes. Each slide is stored as a single frame for as long as its narration runs.
