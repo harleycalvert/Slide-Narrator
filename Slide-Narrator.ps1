@@ -766,7 +766,7 @@ function Invoke-Sapi32([string]$text, [string]$wavPath, [string]$voice, [int]$ra
     $tmp = Join-Path $env:TEMP "slide-narrator-text.txt"
     [IO.File]::WriteAllText($tmp, $text, (New-Object System.Text.UTF8Encoding($true)))
     if (Test-Path $wavPath) { Remove-Item $wavPath -Force }
-    $out = & $script:Ps32 -NoProfile -ExecutionPolicy Bypass -File $script:Sapi32Helper $tmp $wavPath $voice $rate 2>&1
+    $out = & $script:Ps32 -NoProfile -ExecutionPolicy Bypass -File $script:Sapi32Helper $tmp $wavPath $voice "-Rate:$rate" 2>&1   # "-Rate:" so negative speeds aren't read as options
     $ok = (Test-Path $wavPath) -and ((Get-Item $wavPath).Length -gt 1000)
     if (-not $ok) { $script:LastSpeechError = "SAPI32: " + (($out | Out-String).Trim()) }
     return $ok
@@ -1572,9 +1572,9 @@ function Start-AudioJob($job) {
         "balcon" { $exe = $script:BalconExe
                    $argLine = "-f " + (Quote $job.Txt) + " -w " + (Quote $job.Wav) + " -n " + (Quote $voice) + " -s $rate -enc utf8" }
         "sapi32" { $exe = $script:Ps32
-                   $argLine = "-NoProfile -ExecutionPolicy Bypass -File " + (Quote $script:Sapi32Helper) + " " + (Quote $job.Txt) + " " + (Quote $job.Wav) + " " + (Quote $voice) + " $rate" }
+                   $argLine = "-NoProfile -ExecutionPolicy Bypass -File " + (Quote $script:Sapi32Helper) + " " + (Quote $job.Txt) + " " + (Quote $job.Wav) + " " + (Quote $voice) + " -Rate:$rate" }
         default  { $exe = Join-Path $PSHOME "powershell.exe"
-                   $argLine = "-NoProfile -ExecutionPolicy Bypass -File " + (Quote $script:Sapi32Helper) + " " + (Quote $job.Txt) + " " + (Quote $job.Wav) + " " + (Quote $voice) + " $rate" }
+                   $argLine = "-NoProfile -ExecutionPolicy Bypass -File " + (Quote $script:Sapi32Helper) + " " + (Quote $job.Txt) + " " + (Quote $job.Wav) + " " + (Quote $voice) + " -Rate:$rate" }
     }
     $job.Tries++
     $job.PhaseStart = Get-Date
