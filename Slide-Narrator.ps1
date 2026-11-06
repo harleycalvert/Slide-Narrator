@@ -1821,7 +1821,11 @@ function Build-Deck($ppt, $deck) {
             foreach ($slide in $pres.Slides) {
                 $r.Op.N = $slide.SlideIndex
                 Pump-Audio
+                # Hide the narration icon while the picture is taken, then show it again so it still plays
+                $hidden = @()
+                foreach ($shp in $slide.Shapes) { if ($shp.Name -eq "Narration" -and $shp.Visible) { $shp.Visible = $msoFalse; $hidden += $shp } }
                 $slide.Export((Join-Path $deck.WorkDir ("slide_{0:D2}.png" -f $slide.SlideIndex)), "PNG", $w, $h)
+                foreach ($shp in $hidden) { $shp.Visible = $msoTrue }
             }
             $vjob = [pscustomobject]@{
                 Ffmpeg = $script:Ffmpeg; Fps = $r.Fps; Codec = $r.Codec; WorkDir = $deck.WorkDir; Log = $deck.Log
